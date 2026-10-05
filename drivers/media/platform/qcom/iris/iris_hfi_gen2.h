@@ -6,6 +6,7 @@
 #ifndef __IRIS_HFI_GEN2_H__
 #define __IRIS_HFI_GEN2_H__
 
+#include <linux/atomic.h>
 #include "iris_instance.h"
 
 struct iris_core;
@@ -25,6 +26,9 @@ struct iris_core;
  * @dst_subcr_params: subscription params to fw on output port
  */
 struct iris_inst_hfi_gen2 {
+	bool				psr_diag_selected;
+	atomic_t			psr_diag_remaining;
+	atomic_t			psr_diag_external;
 	struct iris_inst		inst;
 	struct iris_hfi_header		*packet;
 	bool				ipsc_properties_set;

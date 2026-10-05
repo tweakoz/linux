@@ -516,6 +516,12 @@ static int cci_probe(struct platform_device *pdev)
 	if (!cci->data)
 		return -ENOENT;
 
+	/* Controller reset always waits on master0, even when only master1 is
+	 * described as an available I2C bus. Initialize all IRQ completions
+	 * before exposing the controller to interrupts or issuing its reset. */
+	for (i = 0; i < NUM_MASTERS; i++)
+		init_completion(&cci->master[i].irq_complete);
+
 	for_each_available_child_of_node(dev->of_node, child) {
 		struct cci_master *master;
 		u32 idx;
@@ -552,7 +558,6 @@ static int cci_probe(struct platform_device *pdev)
 				master->mode = I2C_MODE_FAST_PLUS;
 		}
 
-		init_completion(&master->irq_complete);
 	}
 
 	/* Memory */

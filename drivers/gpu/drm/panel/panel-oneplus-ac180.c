@@ -719,13 +719,13 @@ static int op15_panel_on(struct op15_panel *ctx)
 					    mode->vdisplay - 1);
 
 	/*
-	 * [ADDED] mid-range brightness so first light is visible;
-	 * stock leaves DBV at 0 until Android's first frame
-	 * (qcom,bl-update-flag = "delay_until_first_frame").
+	 * Keep the panel dark during prepare. Forcing the bring-up default here
+	 * exposes DDIC contents before the DSC stream is ready on every wake.
+	 * The DRM panel backlight enable path restores the requested brightness
+	 * after preparation; do not overwrite that request with a visible default.
 	 */
 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, MIPI_DCS_SET_DISPLAY_BRIGHTNESS,
-				     OP15_BL_DEFAULT_DBV >> 8,
-				     OP15_BL_DEFAULT_DBV & 0xff);
+				     0x00, 0x00);
 
 	return dsi_ctx.accum_err;
 }

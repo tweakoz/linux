@@ -150,6 +150,23 @@ static struct clk_rcg2 cam_bist_mclk_cc_mclk3_clk_src = {
 	},
 };
 
+/* PSR front-camera diagnostic: match the OEM XO table encoding on MCLK4.
+ * Boot cfg divider 0 and table divider 1 both report 19.2 MHz, so set_rate
+ * may not run. Only canonicalize XO/no-MND/bypass; retain every other bit.
+ */
+static int cam_bist_mclk4_xo_enable(struct clk_hw *hw)
+{
+	struct clk_rcg2 *rcg = to_clk_rcg2(hw);
+	u32 rate_fields = GENMASK(4, 0) | GENMASK(10, 8) | GENMASK(13, 12);
+
+	if (!(rcg->parked_cfg & rate_fields))
+		rcg->parked_cfg |= 1; /* F(19200000, P_BI_TCXO, 1, 0, 0) */
+
+	return clk_rcg2_shared_ops.enable(hw);
+}
+
+static struct clk_ops cam_bist_mclk4_xo_ops;
+
 static struct clk_rcg2 cam_bist_mclk_cc_mclk4_clk_src = {
 	.cmd_rcgr = 0x4070,
 	.mnd_width = 8,
@@ -162,7 +179,7 @@ static struct clk_rcg2 cam_bist_mclk_cc_mclk4_clk_src = {
 		.parent_data = cam_bist_mclk_cc_parent_data_0,
 		.num_parents = ARRAY_SIZE(cam_bist_mclk_cc_parent_data_0),
 		.flags = CLK_SET_RATE_PARENT,
-		.ops = &clk_rcg2_shared_ops,
+		.ops = &cam_bist_mclk4_xo_ops,
 	},
 };
 
@@ -417,6 +434,9 @@ MODULE_DEVICE_TABLE(of, cam_bist_mclk_cc_kaanapali_match_table);
 
 static int cam_bist_mclk_cc_kaanapali_probe(struct platform_device *pdev)
 {
+	cam_bist_mclk4_xo_ops = clk_rcg2_shared_ops;
+	cam_bist_mclk4_xo_ops.enable = cam_bist_mclk4_xo_enable;
+
 	return qcom_cc_probe(pdev, &cam_bist_mclk_cc_kaanapali_desc);
 }
 

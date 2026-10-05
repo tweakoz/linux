@@ -263,7 +263,22 @@ static int reg_fixed_voltage_probe(struct platform_device *pdev)
 	} else if (drvtype && drvtype->has_performance_state) {
 		drvdata->desc.ops = &fixed_voltage_domain_ops;
 
-		drvdata->performance_state = of_get_required_opp_performance_state(dev->of_node, 0);
+		if (of_machine_is_compatible("oneplus,infiniti") &&
+		    of_property_present(dev->of_node, "qcom,bean-enabled-opp")) {
+			struct device_node *opp;
+			u32 level;
+
+			opp = of_parse_phandle(dev->of_node, "qcom,bean-enabled-opp", 0);
+			if (!opp)
+				return -EINVAL;
+			ret = of_property_read_u32(opp, "opp-level", &level);
+			of_node_put(opp);
+			if (ret || level != 384)
+				return -EINVAL;
+			drvdata->performance_state = level;
+		} else {
+			drvdata->performance_state = of_get_required_opp_performance_state(dev->of_node, 0);
+		}
 		if (drvdata->performance_state < 0) {
 			dev_err(dev, "Can't get performance state from devicetree\n");
 			return drvdata->performance_state;

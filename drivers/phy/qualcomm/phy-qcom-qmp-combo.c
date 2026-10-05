@@ -29,6 +29,11 @@
 
 #include "phy-qcom-qmp-common.h"
 
+static bool bean_hbr3_mx_turbo = true;
+module_param_named(bean_hbr3_mx_turbo, bean_hbr3_mx_turbo, bool, 0600);
+MODULE_PARM_DESC(bean_hbr3_mx_turbo,
+	"Android dp_pll_3nm: vote VDD_MX to TURBO while DP runs at 8.1 Gbit/s on infiniti");
+
 #include "phy-qcom-qmp.h"
 #include "phy-qcom-qmp-pcs-aon-v6.h"
 #include "phy-qcom-qmp-pcs-aon-v8.h"
@@ -2583,6 +2588,8 @@ struct qmp_combo {
 	int num_clks;
 	struct reset_control_bulk_data *resets;
 	struct regulator_bulk_data *vregs;
+	struct regulator *dp_mx_turbo;
+	bool dp_mx_turbo_enabled;
 
 	struct mutex phy_mutex;
 	int init_count;
@@ -4177,8 +4184,21 @@ static int qmp_combo_dp_power_on(struct phy *phy)
 	const struct qmp_phy_cfg *cfg = qmp->cfg;
 	void __iomem *tx = qmp->dp_tx;
 	void __iomem *tx2 = qmp->dp_tx2;
+	int ret;
 
 	mutex_lock(&qmp->phy_mutex);
+
+	if (READ_ONCE(bean_hbr3_mx_turbo) && qmp->dp_mx_turbo &&
+	    qmp->dp_opts.link_rate == 8100 && !qmp->dp_mx_turbo_enabled) {
+		ret = regulator_enable(qmp->dp_mx_turbo);
+		if (ret) {
+			dev_err(qmp->dev, "failed to vote MX turbo for HBR3: %d\n", ret);
+			mutex_unlock(&qmp->phy_mutex);
+			return ret;
+		}
+		qmp->dp_mx_turbo_enabled = true;
+		dev_info(qmp->dev, "Bean HBR3 MX turbo vote enabled\n");
+	}
 
 	qmp_combo_dp_serdes_init(qmp);
 
@@ -4208,6 +4228,12 @@ static int qmp_combo_dp_power_off(struct phy *phy)
 	writel(DP_PHY_PD_CTL_PSR_PWRDN, qmp->dp_dp_phy + QSERDES_DP_PHY_PD_CTL);
 
 	qmp->dp_powered_on = false;
+
+	if (qmp->dp_mx_turbo_enabled) {
+		regulator_disable(qmp->dp_mx_turbo);
+		qmp->dp_mx_turbo_enabled = false;
+		dev_info(qmp->dev, "Bean HBR3 MX turbo vote released\n");
+	}
 
 	mutex_unlock(&qmp->phy_mutex);
 
@@ -5227,6 +5253,16 @@ static int qmp_combo_probe(struct platform_device *pdev)
 					qmp->cfg->vreg_list, &qmp->vregs);
 	if (ret)
 		return ret;
+
+	if (of_machine_is_compatible("oneplus,infiniti")) {
+		qmp->dp_mx_turbo = devm_regulator_get_optional(dev, "vdd-mx");
+		if (IS_ERR(qmp->dp_mx_turbo)) {
+			ret = PTR_ERR(qmp->dp_mx_turbo);
+			if (ret != -ENODEV)
+				return dev_err_probe(dev, ret, "failed to get HBR3 MX turbo supply\n");
+			qmp->dp_mx_turbo = NULL;
+		}
+	}
 
 	/* Check for legacy binding with child nodes. */
 	usb_np = of_get_child_by_name(dev->of_node, "usb3-phy");

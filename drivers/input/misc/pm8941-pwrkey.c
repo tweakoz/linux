@@ -38,6 +38,8 @@
 
 #define PON_PS_HOLD_RST_CTL		0x5a
 #define PON_PS_HOLD_RST_CTL2		0x5b
+#define PON_GEN3_PS_HOLD_RST_CTL	0x52
+#define PON_GEN3_PS_HOLD_RST_CTL2	0x53
 #define  PON_PS_HOLD_ENABLE		BIT(7)
 #define  PON_PS_HOLD_TYPE_MASK		0x0f
 #define  PON_PS_HOLD_TYPE_WARM_RESET	1
@@ -60,6 +62,8 @@ struct pm8941_data {
 	bool		supports_ps_hold_poff_config;
 	bool		supports_debounce_config;
 	bool		has_pon_pbs;
+	unsigned int	ps_hold_ctl;
+	unsigned int	ps_hold_enable;
 	bool		wakeup_source_default;
 	const char	*name;
 	const char	*phys;
@@ -90,14 +94,18 @@ static int pm8941_reboot_notify(struct notifier_block *nb,
 	struct pm8941_pwrkey *pwrkey = container_of(nb, struct pm8941_pwrkey,
 						    reboot_notifier);
 	unsigned int enable_reg;
+	unsigned int control_reg;
 	unsigned int reset_type;
 	int error;
 
 	/* PMICs with revision 0 have the enable bit in same register as ctrl */
-	if (pwrkey->revision == 0)
+	if (pwrkey->data->ps_hold_enable)
+		enable_reg = pwrkey->data->ps_hold_enable;
+	else if (pwrkey->revision == 0)
 		enable_reg = PON_PS_HOLD_RST_CTL;
 	else
 		enable_reg = PON_PS_HOLD_RST_CTL2;
+	control_reg = pwrkey->data->ps_hold_ctl ?: PON_PS_HOLD_RST_CTL;
 
 	error = regmap_update_bits(pwrkey->regmap,
 				   pwrkey->baseaddr + enable_reg,
@@ -129,7 +137,7 @@ static int pm8941_reboot_notify(struct notifier_block *nb,
 	}
 
 	error = regmap_update_bits(pwrkey->regmap,
-				   pwrkey->baseaddr + PON_PS_HOLD_RST_CTL,
+			   pwrkey->baseaddr + control_reg,
 				   PON_PS_HOLD_TYPE_MASK,
 				   reset_type);
 	if (error)
@@ -288,6 +296,8 @@ static int pm8941_pwrkey_probe(struct platform_device *pdev)
 	}
 
 	addr = of_get_address(regmap_node, 0, NULL, NULL);
+	if (!addr && pwrkey->data->has_pon_pbs)
+		addr = of_get_address(parent->of_node, 0, NULL, NULL);
 	if (!addr) {
 		dev_err(&pdev->dev, "reg property missing\n");
 		return -EINVAL;
@@ -297,6 +307,8 @@ static int pm8941_pwrkey_probe(struct platform_device *pdev)
 	if (pwrkey->data->has_pon_pbs) {
 		/* PON_PBS base address is optional */
 		addr = of_get_address(regmap_node, 1, NULL, NULL);
+		if (!addr)
+			addr = of_get_address(parent->of_node, 1, NULL, NULL);
 		if (addr)
 			pwrkey->pon_pbs_baseaddr = be32_to_cpup(addr);
 	}
@@ -446,9 +458,11 @@ static const struct pm8941_data pon_gen3_pwrkey_data = {
 	.status_bit = PON_GEN3_KPDPWR_N_SET,
 	.name = "pmic_pwrkey",
 	.phys = "pmic_pwrkey/input0",
-	.supports_ps_hold_poff_config = false,
+	.supports_ps_hold_poff_config = true,
 	.supports_debounce_config = false,
 	.has_pon_pbs = true,
+	.ps_hold_ctl = PON_GEN3_PS_HOLD_RST_CTL,
+	.ps_hold_enable = PON_GEN3_PS_HOLD_RST_CTL2,
 	.wakeup_source_default = true,
 };
 
