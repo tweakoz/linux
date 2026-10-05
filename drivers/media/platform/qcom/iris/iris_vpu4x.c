@@ -4,6 +4,8 @@
  */
 
 #include <linux/iopoll.h>
+#include <linux/moduleparam.h>
+#include <linux/of.h>
 #include <linux/reset.h>
 
 #include "iris_instance.h"
@@ -22,6 +24,32 @@
 #define DISABLE_VIDEO_APV_BIT	BIT(27)
 #define DISABLE_VIDEO_VPP1_BIT	BIT(28)
 #define DISABLE_VIDEO_VPP0_BIT	BIT(29)
+
+/* Diagnostic only: setter changes software state, never hardware ownership. */
+static bool psr_skip_startup_bridge_resets;
+
+static int psr_set_skip_startup_bridge_resets(const char *val,
+                                            const struct kernel_param *kp)
+{
+	bool enabled;
+	int ret;
+
+	ret = kstrtobool(val, &enabled);
+	if (ret)
+		return ret;
+
+	WRITE_ONCE(*(bool *)kp->arg, enabled);
+	return 0;
+}
+
+static const struct kernel_param_ops psr_startup_bridge_param_ops = {
+	.set = psr_set_skip_startup_bridge_resets,
+	.get = param_get_bool,
+};
+module_param_cb(psr_skip_startup_bridge_resets, &psr_startup_bridge_param_ops,
+		&psr_skip_startup_bridge_resets, 0600);
+MODULE_PARM_DESC(psr_skip_startup_bridge_resets,
+		 "Diagnostic: skip Kaanapali startup bridge reset pulses (default false)");
 
 static int iris_vpu4x_genpd_set_hwmode(struct iris_core *core, bool hw_mode, u32 efuse_value)
 {
@@ -350,12 +378,20 @@ disable_clocks_and_power:
 
 static int iris_vpu4x_set_hwmode(struct iris_core *core)
 {
+	bool skip_resets = READ_ONCE(psr_skip_startup_bridge_resets) &&
+		of_device_is_compatible(core->dev->of_node, "qcom,kaanapali-iris");
 	u32 efuse_value = readl(core->reg_base + WRAPPER_EFUSE_MONITOR);
 
-	if (!(efuse_value & DISABLE_VIDEO_APV_BIT))
-		iris_vpu4x_ahb_sync_reset_apv(core);
+	if (skip_resets) {
+		dev_info_ratelimited(core->dev,
+			"PSR startup bridge resets skipped: efuse=%#x; domain handoff unchanged\n",
+			efuse_value);
+	} else {
+		if (!(efuse_value & DISABLE_VIDEO_APV_BIT))
+			iris_vpu4x_ahb_sync_reset_apv(core);
 
-	iris_vpu4x_ahb_sync_reset_hardware(core);
+		iris_vpu4x_ahb_sync_reset_hardware(core);
+	}
 
 	return iris_vpu4x_genpd_set_hwmode(core, true, efuse_value);
 }
