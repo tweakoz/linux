@@ -69,9 +69,15 @@ MODULE_PARM_DESC(probe_once, "Write cci1-master0-002d once after userspace start
 
 static int psr_enter_probe(struct device *dev, unsigned int address)
 {
-	if (address != 0x2d || !dev->of_node ||
-	    strcmp(dev->of_node->full_name,
-		   "/soc@0/cci@941c000/i2c-bus@0/camera@2d"))
+	struct device_node *expected;
+	bool matches;
+
+	if (address != 0x2d || !dev->of_node)
+		return -ENODEV;
+	expected = of_find_node_by_path("/soc@0/cci@941c000/i2c-bus@0/camera@2d");
+	matches = expected && expected == dev->of_node;
+	of_node_put(expected);
+	if (!matches)
 		return -ENODEV;
 	if (atomic_cmpxchg(&psr_probe_gate, 1, 2) != 1) {
 		dev_info(dev, "PSR tele probe gate closed; no sensor resources acquired\n");
