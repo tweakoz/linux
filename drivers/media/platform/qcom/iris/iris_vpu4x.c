@@ -119,12 +119,23 @@ static void iris_vpu4x_power_off_apv(struct iris_core *core)
 	if (!handshake_done && handshake_busy)
 		dev_err(core->dev, "LPI handshake timeout\n");
 
+	/* OEM requires final DONE even when the initial status was not busy. */
+	ret = readl_poll_timeout(core->reg_base + AON_WRAPPER_MVP_NOC_LPI_STATUS,
+				 value, value & NOC_LPI_STATUS_DONE, 200, 2000);
+	if (ret)
+		dev_err(core->dev, "LPI completion timeout\n");
+	/* Release only this request before the reset handshake. */
+	value = readl(core->reg_base + AON_WRAPPER_MVP_NOC_LPI_CONTROL);
+	writel(value & ~REQ_POWER_DOWN_PREP,
+	       core->reg_base + AON_WRAPPER_MVP_NOC_LPI_CONTROL);
+
 	writel(0x080200, core->reg_base + AON_WRAPPER_MVP_NOC_RESET_REQ);
 	ret = readl_poll_timeout(core->reg_base + AON_WRAPPER_MVP_NOC_RESET_ACK,
-				 value, value & 0x080200, 200, 2000);
+				 value, value == 0x080200, 200, 2000);
 	if (ret)
 		goto disable_clocks_and_power;
 
+	writel(0x080200, core->reg_base + AON_WRAPPER_MVP_NOC_RESET_SYNCRST);
 	writel(0x0, core->reg_base + AON_WRAPPER_MVP_NOC_RESET_SYNCRST);
 	writel(0x0, core->reg_base + AON_WRAPPER_MVP_NOC_RESET_REQ);
 	ret = readl_poll_timeout(core->reg_base + AON_WRAPPER_MVP_NOC_RESET_ACK,
@@ -295,7 +306,7 @@ static void iris_vpu4x_power_off_hardware(struct iris_core *core)
 		writel(0x0, core->reg_base + WRAPPER_CORE_CLOCK_CONFIG);
 
 	readl_poll_timeout(core->reg_base + VCODEC_SS_IDLE_STATUSN, value,
-			   value & VPU_IDLE_BITS, 2000, 20000);
+			   (value & VPU_IDLE_BITS) == VPU_IDLE_BITS, 2000, 20000);
 
 	do {
 		writel(REQ_POWER_DOWN_PREP, core->reg_base + AON_WRAPPER_MVP_NOC_LPI_CONTROL);
@@ -316,12 +327,23 @@ static void iris_vpu4x_power_off_hardware(struct iris_core *core)
 	if (!handshake_done && handshake_busy)
 		dev_err(core->dev, "LPI handshake timeout\n");
 
+	/* OEM requires final DONE even when the initial status was not busy. */
+	ret = readl_poll_timeout(core->reg_base + AON_WRAPPER_MVP_NOC_LPI_STATUS,
+				 value, value & NOC_LPI_STATUS_DONE, 200, 2000);
+	if (ret)
+		dev_err(core->dev, "LPI completion timeout\n");
+	/* Release only this request before the reset handshake. */
+	value = readl(core->reg_base + AON_WRAPPER_MVP_NOC_LPI_CONTROL);
+	writel(value & ~REQ_POWER_DOWN_PREP,
+	       core->reg_base + AON_WRAPPER_MVP_NOC_LPI_CONTROL);
+
 	writel(MVP_NOC_RESET_REQ_MASK, core->reg_base + AON_WRAPPER_MVP_NOC_RESET_REQ);
 	ret = readl_poll_timeout(core->reg_base + AON_WRAPPER_MVP_NOC_RESET_ACK,
-				 value, value & MVP_NOC_RESET_REQ_MASK, 200, 2000);
+				 value, value == MVP_NOC_RESET_REQ_MASK, 200, 2000);
 	if (ret)
 		goto disable_clocks_and_power;
 
+	writel(MVP_NOC_RESET_REQ_MASK, core->reg_base + AON_WRAPPER_MVP_NOC_RESET_SYNCRST);
 	writel(0x0, core->reg_base + AON_WRAPPER_MVP_NOC_RESET_SYNCRST);
 	writel(0x0, core->reg_base + AON_WRAPPER_MVP_NOC_RESET_REQ);
 	ret = readl_poll_timeout(core->reg_base + AON_WRAPPER_MVP_NOC_RESET_ACK,
