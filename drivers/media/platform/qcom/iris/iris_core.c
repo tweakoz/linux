@@ -14,11 +14,21 @@ void iris_core_deinit(struct iris_core *core)
 {
 	int ret;
 
+	if (core->psr_llcc.quarantined)
+		return;
 	ret = pm_runtime_resume_and_get(core->dev);
 
 	mutex_lock(&core->lock);
 	if (core->state != IRIS_CORE_DEINIT) {
-		iris_fw_unload(core);
+		if (iris_fw_unload(core)) {
+			core->state = IRIS_CORE_ERROR;
+			core->psr_llcc.quarantined = true;
+			dev_err(core->dev, "PAS shutdown failed; retain firmware queues/cache and PM reference\n");
+			mutex_unlock(&core->lock);
+			return;
+		}
+		core->psr_llcc.submitted = false;
+		iris_psr_llcc_quiesced(core);
 
 		if (!ret)
 			iris_vpu_power_off(core);
@@ -54,6 +64,10 @@ int iris_core_init(struct iris_core *core)
 	int ret;
 
 	mutex_lock(&core->lock);
+	if (core->psr_llcc.quarantined) {
+		ret = -EIO;
+		goto exit;
+	}
 	if (core->state == IRIS_CORE_INIT) {
 		ret = 0;
 		goto exit;
@@ -84,6 +98,10 @@ int iris_core_init(struct iris_core *core)
 	if (ret)
 		goto error_unload_fw;
 
+	ret = iris_psr_llcc_enable(core);
+	if (ret)
+		goto error_unload_fw;
+
 	core->iris_firmware_data->init_hfi_ops(core);
 
 	ret = iris_hfi_core_init(core);
@@ -95,7 +113,14 @@ int iris_core_init(struct iris_core *core)
 	return iris_wait_for_system_response(core);
 
 error_unload_fw:
-	iris_fw_unload(core);
+	if (iris_fw_unload(core)) {
+		core->state = IRIS_CORE_ERROR;
+		core->psr_llcc.quarantined = true;
+		dev_err(core->dev, "PAS shutdown failed after init error; resources retained\n");
+		goto exit;
+	}
+	core->psr_llcc.submitted = false;
+	iris_psr_llcc_quiesced(core);
 error_power_off:
 	iris_vpu_power_off(core);
 error_queue_deinit:

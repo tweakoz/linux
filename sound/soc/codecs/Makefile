@@ -899,3 +899,7 @@ obj-$(CONFIG_SND_SOC_LPASS_TX_MACRO)	+= snd-soc-lpass-tx-macro.o
 
 # Mux
 obj-$(CONFIG_SND_SOC_SIMPLE_MUX)	+= snd-soc-simple-mux.o
+
+# BEGIN POD PSR TFA986X FIRST TONE
+obj-$(CONFIG_SND_SOC_PSR_TFA986X_FIRST_TONE) += psr-tfa986x-first-tone.o
+# END POD PSR TFA986X FIRST TONE

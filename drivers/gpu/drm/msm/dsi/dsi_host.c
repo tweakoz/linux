@@ -1888,14 +1888,14 @@ static int dsi_populate_dsc_params(struct msm_dsi_host *msm_host, struct drm_dsc
 	}
 
 	dsc->simple_422 = 0;
-	dsc->convert_rgb = 1;
+	dsc->convert_rgb = !(dsc->native_422 || dsc->native_420);
 	dsc->vbr_enable = 0;
 
 	drm_dsc_set_const_params(dsc);
 	drm_dsc_set_rc_buf_thresh(dsc);
 
-	/* DPU supports only pre-SCR panels */
-	ret = drm_dsc_setup_rc_params(dsc, DRM_DSC_1_1_PRE_SCR);
+	ret = drm_dsc_setup_rc_params(dsc, dsc->native_422 ?
+				      DRM_DSC_1_2_422 : DRM_DSC_1_1_PRE_SCR);
 	if (ret) {
 		DRM_DEV_ERROR(&msm_host->pdev->dev, "could not find DSC RC parameters\n");
 		return ret;
@@ -1904,7 +1904,20 @@ static int dsi_populate_dsc_params(struct msm_dsi_host *msm_host, struct drm_dsc
 	dsc->initial_scale_value = drm_dsc_initial_scale_value(dsc);
 	dsc->line_buf_depth = dsc->bits_per_component + 1;
 
-	return drm_dsc_compute_rc_parameters(dsc);
+	if (dsc->native_422) {
+		/* Match the DSC 1.2 first-line budget used by the stock host. */
+		dsc->first_line_bpg_offset = dsc->slice_height < 8 ?
+			2 * (dsc->slice_height - 1) :
+			dsc->slice_height < 20 ? 12 :
+			dsc->slice_height <= 30 ? 13 :
+			dsc->slice_height < 42 ? 14 : 15;
+		/* MSM stores wire bpp; the core helper uses two-pixel containers. */
+		dsc->bits_per_pixel *= 2;
+	}
+	ret = drm_dsc_compute_rc_parameters(dsc);
+	if (dsc->native_422)
+		dsc->bits_per_pixel /= 2;
+	return ret;
 }
 
 static int dsi_host_parse_dt(struct msm_dsi_host *msm_host)

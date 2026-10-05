@@ -353,6 +353,14 @@ static const struct dpu_sspp_sub_blks dpu_rgb_sblk = _RGB_SBLK();
 
 static const struct dpu_sspp_sub_blks dpu_dma_sblk = _DMA_SBLK();
 
+/* DPU 13 moves DMA pixel registers out of the common register block too. */
+static const struct dpu_sspp_sub_blks kaanapali_dma_sblk = {
+	.sspp_rec0_blk = { .name = "sspp_rec0", .base = 0x1000, .len = 0x180 },
+	.sspp_rec1_blk = { .name = "sspp_rec1", .base = 0x3000, .len = 0x180 },
+	.format_list = plane_formats,
+	.num_formats = ARRAY_SIZE(plane_formats),
+};
+
 /*************************************************************
  * MIXER sub blocks config
  *************************************************************/

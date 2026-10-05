@@ -241,6 +241,8 @@ static gpr_driver_t prm_driver = {
 	.gpr_callback = prm_callback,
 	.driver = {
 		.name = "qcom-prm",
+		/* PSR_AUDIO_SERVICES_R3: allow PDR UP acknowledgment during readiness wait. */
+		.probe_type = PROBE_PREFER_ASYNCHRONOUS,
 		.of_match_table = of_match_ptr(prm_device_id),
 	},
 };

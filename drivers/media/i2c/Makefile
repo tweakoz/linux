@@ -174,3 +174,10 @@ obj-$(CONFIG_VIDEO_VPX3220) += vpx3220.o
 obj-$(CONFIG_VIDEO_WM8739) += wm8739.o
 obj-$(CONFIG_VIDEO_WM8775) += wm8775.o
 obj-$(CONFIG_VIDEO_INTEL_CVS) += cvs/
+obj-$(CONFIG_VIDEO_PSR_IMX709) += psr-imx709.o
+obj-$(CONFIG_VIDEO_PSR_IMX906) += psr-imx906.o
+obj-$(CONFIG_VIDEO_PSR_OV50D40) += psr-ov50d40.o
+obj-$(CONFIG_VIDEO_PSR_S5KJN5) += psr-s5kjn5.o
+
+# Same-phone front AON ownership provider, built in with its sole consumer.
+obj-$(CONFIG_VIDEO_PSR_IMX709) += psr-front-aon-mux.o

@@ -4,9 +4,11 @@
  */
 
 #include <linux/bitfield.h>
+#include <linux/of.h>
 
 #include "iris_hfi_gen2.h"
 #include "iris_hfi_gen2_packet.h"
+#include "iris_resources.h"
 
 #define UNSPECIFIED_COLOR_FORMAT 5
 #define NUM_SYS_INIT_PACKETS 8
@@ -42,12 +44,19 @@ static int iris_hfi_gen2_sys_image_version(struct iris_core *core)
 	struct iris_hfi_header *hdr;
 	int ret;
 
-	hdr = kzalloc(SYS_NO_PAYLOAD_PKT_SIZE, GFP_KERNEL);
+	hdr = kzalloc(sizeof(*hdr) + 2 * (sizeof(struct iris_hfi_packet) + sizeof(u32)),
+		      GFP_KERNEL);
 	if (!hdr)
 		return -ENOMEM;
 
 	iris_hfi_gen2_packet_image_version(core, hdr);
 	ret = iris_hfi_queue_cmd_write_locked(core, hdr, hdr->size);
+
+	if (!ret) {
+		iris_hfi_gen2_packet_psr_debug(core, hdr);
+		ret = iris_hfi_queue_cmd_write_locked(core, hdr, hdr->size);
+		dev_info(core->dev, "PSR firmware error/fatal log request: result=%d\n", ret);
+	}
 
 	kfree(hdr);
 
@@ -1287,23 +1296,30 @@ static int iris_hfi_gen2_set_num_comv(struct iris_inst *inst)
 						  &num_comv, sizeof(u32));
 }
 
-static void iris_hfi_gen2_get_buffer(u32 domain, struct iris_buffer *buffer,
+static void iris_hfi_gen2_get_buffer(struct iris_inst *inst, struct iris_buffer *buffer,
 				     struct iris_hfi_buffer *buf)
 {
 	memset(buf, 0, sizeof(*buf));
-	buf->type = iris_hfi_gen2_buf_type_from_driver(domain, buffer->type);
+	buf->type = iris_hfi_gen2_buf_type_from_driver(inst->domain, buffer->type);
 	buf->index = buffer->index;
 	buf->base_address = buffer->device_addr;
 	buf->addr_offset = 0;
 	buf->buffer_size = buffer->buffer_size;
 
-	if (domain == DECODER && buffer->type == BUF_INPUT)
+	if (inst->domain == DECODER && buffer->type == BUF_INPUT)
 		buf->buffer_size = ALIGN(buffer->buffer_size, 256);
 	buf->data_offset = buffer->data_offset;
 	buf->data_size = buffer->data_size;
 	if (buffer->attr & BUF_ATTR_PENDING_RELEASE)
 		buf->flags |= HFI_BUF_HOST_FLAG_RELEASE;
-	buf->flags |= HFI_BUF_HOST_FLAGS_CB_NON_SECURE;
+	/* Canoe firmware distinguishes pixel IOVAs from the other nonsecure CB.
+	 * Use the same region selector as DMA allocation. Keep legacy SoCs intact.
+	 */
+	if (of_device_is_compatible(inst->core->dev->of_node, "qcom,kaanapali-iris") &&
+	    iris_get_region(inst, buffer->type) == IRIS_PIXEL_REGION)
+		buf->flags |= HFI_BUF_HOST_FLAGS_CB_NON_SECURE_PIXEL;
+	else
+		buf->flags |= HFI_BUF_HOST_FLAGS_CB_NON_SECURE;
 	buf->timestamp = buffer->timestamp;
 }
 
@@ -1314,7 +1330,7 @@ static int iris_hfi_gen2_session_queue_buffer(struct iris_inst *inst, struct iri
 	u32 port;
 	int ret;
 
-	iris_hfi_gen2_get_buffer(inst->domain, buffer, &hfi_buffer);
+	iris_hfi_gen2_get_buffer(inst, buffer, &hfi_buffer);
 	if (buffer->type == BUF_COMV) {
 		ret = iris_hfi_gen2_set_num_comv(inst);
 		if (ret)
@@ -1341,7 +1357,7 @@ static int iris_hfi_gen2_session_release_buffer(struct iris_inst *inst, struct i
 	struct iris_hfi_buffer hfi_buffer;
 	u32 port;
 
-	iris_hfi_gen2_get_buffer(inst->domain, buffer, &hfi_buffer);
+	iris_hfi_gen2_get_buffer(inst, buffer, &hfi_buffer);
 	hfi_buffer.flags |= HFI_BUF_HOST_FLAG_RELEASE;
 	port = iris_hfi_gen2_get_port_from_buf_type(inst, buffer->type);
 

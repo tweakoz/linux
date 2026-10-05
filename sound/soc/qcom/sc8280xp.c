@@ -70,6 +70,7 @@ struct qcom_snd_soc_common {
 	bool codec_sysclk_set;
 	bool mi2s_mclk_enable;
 	bool mi2s_bclk_enable;
+	bool psr_primary_mi2s;
 	bool wcd_jack;
 	int (*snd_prepare)(struct snd_pcm_substream *substream);
 };
@@ -225,6 +226,25 @@ static int sc8280xp_be_hw_params_fixup(struct snd_soc_pcm_runtime *rtd,
 					SNDRV_PCM_HW_PARAM_CHANNELS);
 	struct snd_mask *fmt = hw_param_mask(params, SNDRV_PCM_HW_PARAM_FORMAT);
 
+	/* Scope the PSR format to this board and its primary playback backend. */
+	struct sc8280xp_snd_data *data = snd_soc_card_get_drvdata(rtd->card);
+	if (data->priv->psr_primary_mi2s && cpu_dai->id == PRIMARY_MI2S_RX) {
+		rate->min = rate->max = 48000;
+		channels->min = channels->max = 2;
+		snd_mask_none(fmt);
+		snd_mask_set_format(fmt, SNDRV_PCM_FORMAT_S32_LE);
+		return 0;
+	}
+
+	/* PSR physical WCD capture: stock RXTX TX3 is 48k/24-bit/stereo. */
+	if (data->priv->psr_primary_mi2s && cpu_dai->id == TX_CODEC_DMA_TX_3) {
+		rate->min = rate->max = 48000;
+		channels->min = channels->max = 2;
+		snd_mask_none(fmt);
+		snd_mask_set_format(fmt, SNDRV_PCM_FORMAT_S24_LE);
+		return 0;
+	}
+
 	rate->min = rate->max = 48000;
 	snd_mask_set_format(fmt, SNDRV_PCM_FORMAT_S16_LE);
 	channels->min = 2;
@@ -264,7 +284,14 @@ static int sc8280xp_snd_hw_params(struct snd_pcm_substream *substream,
 		if (ret && ret != -ENOTSUPP)
 			return ret;
 
-		if (data->priv->codec_dai_fmt) {
+		if (data->priv->psr_primary_mi2s) {
+			int i;
+			for_each_rtd_codec_dais(rtd, i, codec_dai) {
+				ret = snd_soc_dai_set_fmt(codec_dai, data->priv->codec_dai_fmt);
+				if (ret)
+					return ret;
+			}
+		} else if (data->priv->codec_dai_fmt) {
 			ret = snd_soc_dai_set_fmt(codec_dai,
 						  data->priv->codec_dai_fmt);
 			if (ret && ret != -ENOTSUPP)
@@ -454,6 +481,23 @@ static const struct qcom_snd_soc_common hawi_priv_data = {
 	.wcd_jack = true,
 };
 
+/* Offline PSR proposal: no codec sysclk/MCLK or amplifier controls. */
+static const struct snd_soc_dapm_widget psr_microphone_widgets[] = {
+	SND_SOC_DAPM_MIC("Analog Mic1", NULL),
+	SND_SOC_DAPM_MIC("Analog Mic3", NULL),
+	SND_SOC_DAPM_MIC("Analog Mic5", NULL),
+};
+
+static const struct qcom_snd_soc_common psr_mi2s_priv_data = {
+	.dapm_widgets = psr_microphone_widgets,
+	.num_dapm_widgets = ARRAY_SIZE(psr_microphone_widgets),
+	.driver_name = "psr-mi2s",
+	.mi2s_bclk_enable = true,
+	.psr_primary_mi2s = true,
+	.codec_dai_fmt = SND_SOC_DAIFMT_CBC_CFC | SND_SOC_DAIFMT_NB_NF |
+			 SND_SOC_DAIFMT_I2S,
+};
+
 static const struct qcom_snd_soc_common kaanapali_priv_data = {
 	.driver_name = "kaanapali",
 	.dapm_widgets = sc8280xp_dapm_widgets,
@@ -559,6 +603,7 @@ static const struct qcom_snd_soc_common sm8750_priv_data = {
 };
 
 static const struct of_device_id snd_sc8280xp_dt_match[] = {
+	{ .compatible = "oneplus,psr-mi2s-sndcard", .data = &psr_mi2s_priv_data },
 	{ .compatible = "ayaneo,pocket-s2-sndcard", .data = &ayaneo_ps2_priv_data },
 	{ .compatible = "qcom,eliza-sndcard", .data = &eliza_priv_data },
 	{ .compatible = "qcom,hawi-sndcard", .data = &hawi_priv_data },

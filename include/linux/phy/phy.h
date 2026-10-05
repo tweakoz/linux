@@ -20,6 +20,7 @@
 #include <linux/phy/phy-hdmi.h>
 #include <linux/phy/phy-lvds.h>
 #include <linux/phy/phy-mipi-dphy.h>
+#include <linux/phy/phy-mipi-cphy.h>
 
 struct phy;
 
@@ -45,6 +46,7 @@ enum phy_mode {
 	PHY_MODE_LVDS,
 	PHY_MODE_DP,
 	PHY_MODE_HDMI,
+	PHY_MODE_MIPI_CPHY,
 };
 
 enum phy_media {
@@ -65,6 +67,7 @@ union phy_notify {
 /**
  * union phy_configure_opts - Opaque generic phy configuration
  *
+ * @mipi_cphy: Experimental PSR C-PHY timing contract.
  * @mipi_dphy:	Configuration set applicable for phys supporting
  *		the MIPI_DPHY phy mode.
  * @dp:		Configuration set applicable for phys supporting
@@ -75,6 +78,7 @@ union phy_notify {
  *		the HDMI phy mode.
  */
 union phy_configure_opts {
+	struct phy_configure_opts_mipi_cphy mipi_cphy;
 	struct phy_configure_opts_mipi_dphy	mipi_dphy;
 	struct phy_configure_opts_dp		dp;
 	struct phy_configure_opts_lvds		lvds;
@@ -284,6 +288,8 @@ struct phy *devm_of_phy_optional_get(struct device *dev, struct device_node *np,
 				     const char *con_id);
 struct phy *devm_of_phy_get_by_index(struct device *dev, struct device_node *np,
 				     int index);
+struct phy *phy_get_by_of_node(struct device_node *np);
+struct phy *devm_phy_get_by_of_node(struct device *dev, struct device_node *np);
 void of_phy_put(struct phy *phy);
 void phy_put(struct device *dev, struct phy *phy);
 void devm_phy_put(struct device *dev, struct phy *phy);
@@ -489,6 +495,17 @@ static inline struct phy *devm_of_phy_optional_get(struct device *dev,
 static inline struct phy *devm_of_phy_get_by_index(struct device *dev,
 						   struct device_node *np,
 						   int index)
+{
+	return ERR_PTR(-ENOSYS);
+}
+
+static inline struct phy *phy_get_by_of_node(struct device_node *np)
+{
+	return ERR_PTR(-ENOSYS);
+}
+
+static inline struct phy *devm_phy_get_by_of_node(struct device *dev,
+						  struct device_node *np)
 {
 	return ERR_PTR(-ENOSYS);
 }

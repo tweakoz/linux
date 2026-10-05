@@ -834,7 +834,8 @@ static void csid_try_format(struct csid_device *csid,
 		if (i >= csid->res->formats->nformats)
 			fmt->code = MEDIA_BUS_FMT_UYVY8_1X16;
 
-		fmt->width = clamp_t(u32, fmt->width, 1, 8191);
+		fmt->width = clamp_t(u32, fmt->width, 1,
+				     camss_frame_max_width(csid->camss));
 		fmt->height = clamp_t(u32, fmt->height, 1, 8191);
 
 		fmt->field = V4L2_FIELD_NONE;
@@ -1276,6 +1277,7 @@ static int csid_link_setup(struct media_entity *entity,
 			tpg = v4l2_get_subdevdata(sd);
 
 			csid->phy.lane_cnt = tpg->res->lane_cnt;
+			csid->phy.cphy = false;
 			csid->phy.csiphy_id = tpg->id;
 			csid->phy.lane_assign = csid_get_lane_assign(NULL, csid->phy.lane_cnt);
 			csid->tpg_linked = true;
@@ -1287,6 +1289,7 @@ static int csid_link_setup(struct media_entity *entity,
 			if (!csiphy->cfg.csi2)
 				return -EPERM;
 
+			csid->phy.cphy = csiphy->cfg.csi2->cphy;
 			csid->phy.csiphy_id = csiphy->id;
 
 			lane_cfg = &csiphy->cfg.csi2->lane_cfg;
