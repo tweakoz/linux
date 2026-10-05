@@ -3,6 +3,8 @@
  * Copyright (c) 2022-2024 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
+#include <linux/moduleparam.h>
+#include <linux/of.h>
 #include <linux/pm_runtime.h>
 #include <media/v4l2-event.h>
 #include <media/v4l2-ioctl.h>
@@ -22,6 +24,32 @@
 #define IRIS_BUS_NAME "platform:iris_icc"
 #define STEP_WIDTH 1
 #define STEP_HEIGHT 1
+
+/* Diagnostic first-open interlock; closing does not revoke existing handles. */
+static bool psr_allow_kaanapali_open;
+
+static int psr_set_allow_kaanapali_open(const char *val,
+				      const struct kernel_param *kp)
+{
+	bool enabled;
+	int ret;
+
+	ret = kstrtobool(val, &enabled);
+	if (ret)
+		return ret;
+
+	WRITE_ONCE(*(bool *)kp->arg, enabled);
+	return 0;
+}
+
+static const struct kernel_param_ops psr_initial_open_param_ops = {
+	.set = psr_set_allow_kaanapali_open,
+	.get = param_get_bool,
+};
+module_param_cb(psr_allow_kaanapali_open, &psr_initial_open_param_ops,
+		&psr_allow_kaanapali_open, 0600);
+MODULE_PARM_DESC(psr_allow_kaanapali_open,
+		 "Diagnostic: allow Kaanapali video opens (default false)");
 
 static void iris_v4l2_fh_init(struct iris_inst *inst, struct file *filp)
 {
@@ -143,6 +171,21 @@ int iris_open(struct file *filp)
 		session_type = ENCODER;
 	else
 		return -EINVAL;
+
+	/* Both encoder and decoder must be opted in before any PM/firmware work. */
+	if (of_device_is_compatible(core->dev->of_node, "qcom,kaanapali-iris")) {
+		bool allowed = READ_ONCE(psr_allow_kaanapali_open);
+
+		if (!allowed) {
+			dev_info_ratelimited(core->dev,
+				"PSR Iris diagnostic open denied before PM: domain=%u\n",
+				session_type);
+			return -EAGAIN;
+		}
+		dev_info_ratelimited(core->dev,
+			"PSR Iris diagnostic open accepted before PM: domain=%u\n",
+			session_type);
+	}
 
 	ret = pm_runtime_resume_and_get(core->dev);
 	if (ret < 0)
