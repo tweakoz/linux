@@ -38,6 +38,7 @@
 #include "ufs-debugfs.h"
 #include "ufs-fault-injection.h"
 #include "ufs_bsg.h"
+#include "infiniti-readonly.h"
 #include "ufshcd-crypto.h"
 #include <linux/unaligned.h>
 
@@ -3086,6 +3087,20 @@ static enum scsi_qc_status ufshcd_queuecommand(struct Scsi_Host *host,
 	int err = 0;
 	struct ufs_hw_queue *hwq = NULL;
 
+	if (IS_ENABLED(CONFIG_SCSI_UFS_INFINITI_READONLY) &&
+	    !infiniti_scsi_read_allowed(cmd->cmnd, cmd->cmd_len,
+		cmd->sc_data_direction == DMA_FROM_DEVICE,
+		cmd->sc_data_direction == DMA_NONE) &&
+	    !(IS_ENABLED(CONFIG_SCSI_UFS_INFINITI_USERDATA_WRITES) &&
+	      infiniti_userdata_write_allowed(cmd->cmnd, cmd->cmd_len,
+		cmd->device->lun, cmd->device->sector_size,
+		scsi_bufflen(cmd), cmd->sc_data_direction == DMA_TO_DEVICE,
+		cmd->sc_data_direction == DMA_NONE))) {
+		scsi_build_sense(cmd, 0, DATA_PROTECT, 0x27, 0x00);
+		scsi_done(cmd);
+		return 0;
+	}
+
 	switch (hba->ufshcd_state) {
 	case UFSHCD_STATE_OPERATIONAL:
 		break;
@@ -3346,6 +3361,17 @@ static int ufshcd_issue_dev_cmd(struct ufs_hba *hba, struct scsi_cmnd *cmd,
 	struct request *rq = scsi_cmd_to_rq(cmd);
 	blk_status_t sts;
 
+	if (IS_ENABLED(CONFIG_SCSI_UFS_INFINITI_READONLY)) {
+		const struct utp_upiu_req *req = lrbp->ucd_req_ptr;
+
+		/* Inspect the actual UPIU, including raw and advanced RPMB paths. */
+		if (req->header.transaction_code != UPIU_TRANSACTION_NOP_OUT &&
+		    (req->header.transaction_code != UPIU_TRANSACTION_QUERY_REQ ||
+		     !infiniti_query_allowed(req->qr.opcode, req->qr.idn,
+					     req->qr.index, req->qr.selector)))
+			return -EROFS;
+	}
+
 	rq->timeout = timeout;
 	sts = blk_execute_rq(rq, true);
 	if (sts != BLK_STS_OK)
@@ -3378,6 +3404,7 @@ static int ufshcd_exec_dev_cmd(struct ufs_hba *hba,
 
 	if (WARN_ON_ONCE(!cmd))
 		return -ENOMEM;
+
 
 	tag = scsi_cmd_to_rq(cmd)->tag;
 
@@ -5622,7 +5649,8 @@ static int ufshcd_sdev_configure(struct scsi_device *sdev,
 	 */
 	if (is_device_wlun(sdev))
 		pm_runtime_get_noresume(&sdev->sdev_gendev);
-	else if (ufshcd_is_rpm_autosuspend_allowed(hba))
+	else if (!IS_ENABLED(CONFIG_SCSI_UFS_INFINITI_READONLY) &&
+		 ufshcd_is_rpm_autosuspend_allowed(hba))
 		sdev->rpm_autosuspend = 1;
 	/*
 	 * Do not print messages during runtime PM to avoid never-ending cycles
@@ -11468,7 +11496,11 @@ static int ufshcd_wl_probe(struct scsi_device *sdev)
 
 	blk_pm_runtime_init(sdev->request_queue, dev);
 	pm_runtime_set_autosuspend_delay(dev, 0);
-	pm_runtime_allow(dev);
+	/* Diagnostic reads must not trigger suspend commands rejected by the
+	 * command allowlist. Keep the device WLUN active from initial probe.
+	 */
+	if (!IS_ENABLED(CONFIG_SCSI_UFS_INFINITI_READONLY))
+		pm_runtime_allow(dev);
 
 	return  0;
 }

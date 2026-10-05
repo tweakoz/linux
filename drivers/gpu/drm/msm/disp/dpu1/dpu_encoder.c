@@ -1302,9 +1302,19 @@ static void _dpu_encoder_virt_enable_helper(struct drm_encoder *drm_enc)
 	if (dpu_enc->disp_info.intf_type == INTF_DSI &&
 			!WARN_ON(dpu_enc->num_phys_encs == 0)) {
 		unsigned bpc = dpu_enc->connector->display_info.bpc;
+		unsigned int num_pp = 0;
+
+		for (i = 0; i < MAX_CHANNELS_PER_ENC; i++)
+			if (dpu_enc->hw_pp[i])
+				num_pp++;
+
 		for (i = 0; i < MAX_CHANNELS_PER_ENC; i++) {
 			if (!dpu_enc->hw_pp[i])
 				continue;
+			/* Match canoe's four-line latency buffer per active channel. */
+			if (dpu_enc->hw_pp[i]->ops.set_fifo_size)
+				dpu_enc->hw_pp[i]->ops.set_fifo_size(dpu_enc->hw_pp[i],
+					drm_enc->crtc->state->adjusted_mode.hdisplay * 4 / num_pp);
 			_dpu_encoder_setup_dither(dpu_enc->hw_pp[i], bpc);
 		}
 	}
@@ -1970,6 +1980,17 @@ dpu_encoder_dsc_initial_line_calc(struct drm_dsc_config *dsc,
 	int ssm_delay, total_pixels, soft_slice_per_enc;
 
 	soft_slice_per_enc = enc_ip_width / dsc->slice_width;
+	if (dsc->native_422) {
+		/* Vendor Hardent latency model for four-component containers. */
+		int bpp = (dsc->bits_per_pixel >> 4) * 2;
+		int mux = dsc->bits_per_component >= 12 ? 64 : 48;
+		int input_latency = 28 + 3 * (91 + 2) * soft_slice_per_enc;
+		int output_latency = DIV_ROUND_UP(9 * 128 + mux, bpp) + 1;
+		int extra_latency = DIV_ROUND_UP(8 * dsc->slice_chunk_size, bpp);
+
+		return DIV_ROUND_UP(dsc->initial_xmit_delay + input_latency +
+				    output_latency + extra_latency, dsc->slice_width / 2);
+	}
 
 	/*
 	 * minimum number of initial line pixels is a sum of:
@@ -2012,6 +2033,13 @@ static void dpu_encoder_dsc_pipe_cfg(struct dpu_hw_ctl *ctl,
 
 	if (ctl->ops.update_pending_flush_dsc)
 		ctl->ops.update_pending_flush_dsc(ctl, hw_dsc->idx);
+	if (dsc->native_422 && dsc->pic_width == 1272 &&
+	    dsc->pic_height == 2772 && dsc->slice_count == 2 &&
+	    hw_pp->ops.setup_aa601_spr && ctl->ops.update_pending_flush_dspp) {
+		hw_pp->ops.setup_aa601_spr(hw_pp);
+		ctl->ops.update_pending_flush_dspp(ctl,
+			DSPP_0 + hw_pp->idx - PINGPONG_0, DPU_DSPP_SPR);
+	}
 }
 
 static void dpu_encoder_prep_dsc(struct dpu_encoder_virt *dpu_enc,

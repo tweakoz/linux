@@ -42,6 +42,9 @@ struct dpu_hw_dither_cfg {
  *  @get_line_count: obtain current vertical line counter
  */
 struct dpu_hw_pingpong_ops {
+	/** @set_fifo_size: Set latency FIFO capacity in pixels. */
+	void (*set_fifo_size)(struct dpu_hw_pingpong *pp, u32 pixels);
+
 	/**
 	 * @enable_tearcheck: enables vysnc generation and sets up init value of
 	 * read pointer and programs the tear check cofiguration
@@ -91,6 +94,9 @@ struct dpu_hw_pingpong_ops {
 	 * @setup_dsc: Setup DSC
 	 */
 	int (*setup_dsc)(struct dpu_hw_pingpong *pp);
+
+	/* Temporary AA601 full-frame SPR preset for RAM display bring-up. */
+	void (*setup_aa601_spr)(struct dpu_hw_pingpong *pp);
 };
 
 struct dpu_hw_merge_3d;

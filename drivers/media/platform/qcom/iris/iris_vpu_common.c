@@ -503,5 +503,15 @@ err:
 
 void iris_vpu_set_preset_registers(struct iris_core *core)
 {
+	const struct iris_platform_data *data = core->iris_platform_data;
+	u32 i;
+
+	if (data->reg_presets && data->num_reg_presets) {
+		for (i = 0; i < data->num_reg_presets; i++)
+			writel(data->reg_presets[i].value,
+			       core->reg_base + data->reg_presets[i].reg);
+		return;
+	}
+
 	writel(0x0, core->reg_base + 0xb0088);
 }

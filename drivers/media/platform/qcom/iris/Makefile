@@ -1,6 +1,7 @@
 qcom-iris-objs += iris_buffer.o \
              iris_common.o \
              iris_core.o \
+             iris_psr_llcc.o \
              iris_ctrls.o \
              iris_firmware.o \
              iris_hfi_common.o \
@@ -30,3 +31,7 @@ qcom-iris-objs += iris_buffer.o \
              iris_vpu_common.o \
 
 obj-$(CONFIG_VIDEO_QCOM_IRIS) += qcom-iris.o
+
+ifdef CONFIG_VIDEO_QCOM_IRIS
+obj-y += iris_vpu_bus.o
+endif

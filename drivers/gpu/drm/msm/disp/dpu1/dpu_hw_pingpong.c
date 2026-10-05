@@ -3,6 +3,7 @@
  */
 
 #include <linux/iopoll.h>
+#include <linux/of.h>
 
 #include <drm/drm_managed.h>
 
@@ -272,6 +273,12 @@ static void dpu_hw_pp_dsc_disable(struct dpu_hw_pingpong *pp)
 	DPU_REG_WRITE(c, PP_DSC_MODE, 0);
 }
 
+static void dpu_hw_pp_set_fifo_size(struct dpu_hw_pingpong *pp, u32 pixels)
+{
+	/* Kaanapali PPB_FIFO_SIZE_CFG: four pixels per FIFO entry. */
+	DPU_REG_WRITE(&pp->hw, 0x01c, (pixels / 4) & 0x0fff);
+}
+
 static int dpu_hw_pp_setup_dsc(struct dpu_hw_pingpong *pp)
 {
 	struct dpu_hw_blk_reg_map *pp_c = &pp->hw;
@@ -281,6 +288,36 @@ static int dpu_hw_pp_setup_dsc(struct dpu_hw_pingpong *pp)
 	data |= BIT(18); /* endian flip */
 	DPU_REG_WRITE(pp_c, PP_DCE_DATA_OUT_SWAP, data);
 	return 0;
+}
+
+/* Diagnostic AA601 preset captured from stock, using only configuration
+ * offsets written by reg_dmav1_setup_spr_init_common/cfg3/cfg5/kickoff.
+ * Canoe SPR0/1 are PP0/1 + 0x400. No status or LUT command ports are written.
+ * This must become a DSPP operation with panel data before general use.
+ */
+static void dpu_hw_pp_setup_aa601_spr(struct dpu_hw_pingpong *pp)
+{
+	static const struct { u32 off, val; } cfg[] = {
+		{0x20, 0}, {0x24, 0x5e}, {0x28, 0}, {0x2c, 0x3c2}, {0x30, 0},
+		{0x34, 0x01000000}, {0x38, 0x100},
+		{0x3c, 0x01000000}, {0x40, 0x100},
+		{0x44, 0x01000000}, {0x48, 0x100},
+		{0x4c, 0x01000000}, {0x50, 0x100},
+		{0x70, 0x15555555}, {0x74, 0}, {0x7c, 0x04441212},
+		{0xa0, 0x00840000}, {0xa4, 0x018c0108},
+		{0xa8, 0x02950211}, {0xac, 0x039d0319},
+		{0xb0, 0x04a50421}, {0xb4, 0x05ad0529},
+		{0xb8, 0x06b60632}, {0xbc, 0x07be073a},
+		{0xc0, 0x08c60842}, {0xc4, 0x09ce094a},
+		{0xc8, 0x0ad70a53}, {0xcc, 0x0bdf0b5b},
+		{0xd0, 0x0ce70c63}, {0xd4, 0x0def0d6b},
+		{0xd8, 0x0ef80e74}, {0xdc, 0x0fff0f7c},
+		{0x08, 1}, {0x04, 0x05289107},
+	};
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(cfg); i++)
+		DPU_REG_WRITE(&pp->hw, 0x400 + cfg[i].off, cfg[i].val);
 }
 
 /**
@@ -308,6 +345,14 @@ struct dpu_hw_pingpong *dpu_hw_pingpong_init(struct drm_device *dev,
 
 	c->idx = cfg->id;
 	c->caps = cfg;
+
+	/* Scope this bring-up operation to the audited DPU 13.0 layout. */
+	if (mdss_rev->core_major_ver == 13 && !mdss_rev->core_minor_ver)
+		c->ops.set_fifo_size = dpu_hw_pp_set_fifo_size;
+	if (mdss_rev->core_major_ver == 13 && !mdss_rev->core_minor_ver &&
+	    of_machine_is_compatible("oneplus,infiniti") &&
+	    (cfg->id == PINGPONG_0 || cfg->id == PINGPONG_1))
+		c->ops.setup_aa601_spr = dpu_hw_pp_setup_aa601_spr;
 
 	if (mdss_rev->core_major_ver < 5) {
 		WARN_ON(!cfg->intr_rdptr);

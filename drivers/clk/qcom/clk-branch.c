@@ -11,6 +11,7 @@
 #include <linux/export.h>
 #include <linux/clk-provider.h>
 #include <linux/regmap.h>
+#include <linux/string.h>
 
 #include "clk-branch.h"
 
@@ -127,7 +128,25 @@ EXPORT_SYMBOL_GPL(clk_branch_ops);
 
 static int clk_branch2_enable(struct clk_hw *hw)
 {
-	return clk_branch_toggle(hw, true, clk_branch2_check_halt);
+	struct clk_branch *br = to_clk_branch(hw);
+	int ret;
+
+	ret = clk_branch_toggle(hw, true, clk_branch2_check_halt);
+	/* PSR diagnostic: observe the failed request before CCF unwinds it. */
+	if (ret && br->halt_reg == 0x4088 &&
+	    !strcmp(clk_hw_get_name(hw), "cam_bist_mclk_cc_mclk4_clk")) {
+		u32 cmd = 0, cfg = 0, cbcr = 0, sleep = 0;
+		int cmd_ret, cfg_ret, cbcr_ret, sleep_ret;
+
+		cmd_ret = regmap_read(br->clkr.regmap, 0x4070, &cmd);
+		cfg_ret = regmap_read(br->clkr.regmap, 0x4074, &cfg);
+		cbcr_ret = regmap_read(br->clkr.regmap, 0x4088, &cbcr);
+		sleep_ret = regmap_read(br->clkr.regmap, 0x40e0, &sleep);
+		pr_warn_ratelimited("PSR MCLK4 enable=%d CMD=%08x(%d) CFG=%08x(%d) CBCR=%08x(%d) SLEEP=%08x(%d)\n",
+				    ret, cmd, cmd_ret, cfg, cfg_ret, cbcr, cbcr_ret,
+				    sleep, sleep_ret);
+	}
+	return ret;
 }
 
 static void clk_branch2_disable(struct clk_hw *hw)

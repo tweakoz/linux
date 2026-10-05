@@ -87,6 +87,10 @@ int iris_hfi_core_init(struct iris_core *core)
 	if (ret)
 		return ret;
 
+	ret = iris_psr_llcc_submit(core);
+	if (ret)
+		return ret;
+
 	return hfi_ops->sys_interframe_powercollapse(core);
 }
 
@@ -121,6 +125,9 @@ int iris_hfi_pm_suspend(struct iris_core *core)
 {
 	int ret;
 
+	if (core->psr_llcc.quarantined)
+		return -EIO;
+
 	ret = iris_vpu_prepare_pc(core);
 	if (ret) {
 		pm_runtime_mark_last_busy(core->dev);
@@ -132,6 +139,7 @@ int iris_hfi_pm_suspend(struct iris_core *core)
 	if (ret)
 		goto error;
 
+	iris_psr_llcc_quiesced(core);
 	iris_vpu_power_off(core);
 
 	return 0;
@@ -146,6 +154,9 @@ int iris_hfi_pm_resume(struct iris_core *core)
 {
 	const struct iris_hfi_sys_ops *ops = core->hfi_sys_ops;
 	int ret;
+
+	if (core->psr_llcc.quarantined)
+		return -EIO;
 
 	ret = iris_vpu_power_on(core);
 	if (ret)
@@ -163,6 +174,13 @@ int iris_hfi_pm_resume(struct iris_core *core)
 	if (ret)
 		goto err_suspend_hw;
 
+	ret = iris_psr_llcc_enable(core);
+	if (ret)
+		goto err_suspend_hw;
+	ret = iris_psr_llcc_submit(core);
+	if (ret)
+		goto err_suspend_hw;
+
 	ret = ops->sys_interframe_powercollapse(core);
 	if (ret)
 		goto err_suspend_hw;
@@ -170,7 +188,8 @@ int iris_hfi_pm_resume(struct iris_core *core)
 	return 0;
 
 err_suspend_hw:
-	iris_set_hw_state(core, false);
+	if (!iris_set_hw_state(core, false))
+		iris_psr_llcc_quiesced(core);
 err_power_off:
 	iris_vpu_power_off(core);
 error:

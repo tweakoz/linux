@@ -5,6 +5,7 @@
  */
 #include <linux/auxiliary_bus.h>
 #include <linux/bitfield.h>
+#include <linux/delay.h>
 #include <linux/cleanup.h>
 #include <linux/module.h>
 #include <linux/of.h>
@@ -110,6 +111,8 @@ struct pmic_glink_altmode_port {
 	struct typec_altmode tbt_alt;
 
 	struct work_struct work;
+	struct work_struct hpd_replay_work;
+	unsigned int hpd_replay_ms;
 
 	struct auxiliary_device *bridge;
 
@@ -124,6 +127,21 @@ struct pmic_glink_altmode_port {
 };
 
 #define work_to_altmode(w) container_of((w), struct pmic_glink_altmode, enable_work)
+
+struct pmic_glink_altmode;
+
+static DEFINE_MUTEX(bean_hpd_replay_lock);
+static struct pmic_glink_altmode *bean_hpd_replay_altmode;
+static unsigned int bean_hpd_replay_ms;
+static int bean_hpd_replay_set(const char *val, const struct kernel_param *kp);
+
+static const struct kernel_param_ops bean_hpd_replay_ops = {
+	.set = bean_hpd_replay_set,
+	.get = param_get_uint,
+};
+module_param_cb(bean_hpd_replay_ms, &bean_hpd_replay_ops, &bean_hpd_replay_ms, 0644);
+MODULE_PARM_DESC(bean_hpd_replay_ms,
+	"Write N to drop DP HPD for N ms and raise it again, as Android's debugfs hpd 0/1");
 
 struct pmic_glink_altmode {
 	struct device *dev;
@@ -344,6 +362,83 @@ static void pmic_glink_altmode_safe(struct pmic_glink_altmode *altmode,
 	ret = typec_retimer_set(port->typec_retimer, &port->retimer_state);
 	if (ret)
 		dev_err(altmode->dev, "failed to setup retimer to USB: %d\n", ret);
+}
+
+static bool pmic_glink_altmode_hpd_high(const struct pmic_glink_altmode_port *alt_port)
+{
+	return READ_ONCE(alt_port->svid) == USB_TYPEC_DP_SID && READ_ONCE(alt_port->hpd_state);
+}
+
+static void pmic_glink_altmode_hpd_replay(struct work_struct *work)
+{
+	struct pmic_glink_altmode_port *alt_port = container_of(work,
+			struct pmic_glink_altmode_port, hpd_replay_work);
+	unsigned int ms = READ_ONCE(alt_port->hpd_replay_ms);
+
+	if (!pmic_glink_altmode_hpd_high(alt_port))
+		return;
+
+	dev_info(alt_port->altmode->dev, "Bean altmode: HPD replay: low for %u ms\n", ms);
+	drm_aux_hpd_bridge_notify(&alt_port->bridge->dev, connector_status_disconnected);
+	msleep(ms);
+	if (!pmic_glink_altmode_hpd_high(alt_port)) {
+		dev_info(alt_port->altmode->dev, "Bean altmode: HPD replay: sink HPD went low\n");
+		return;
+	}
+
+	dev_info(alt_port->altmode->dev, "Bean altmode: HPD replay: high again\n");
+	drm_aux_hpd_bridge_notify(&alt_port->bridge->dev, connector_status_connected);
+}
+
+static int bean_hpd_replay_set(const char *val, const struct kernel_param *kp)
+{
+	struct pmic_glink_altmode *altmode;
+	unsigned int queued = 0;
+	unsigned int ms;
+	unsigned int i;
+	int ret;
+
+	ret = kstrtouint(val, 0, &ms);
+	if (ret)
+		return ret;
+
+	if (!ms || ms > 30000)
+		return -EINVAL;
+
+	guard(mutex)(&bean_hpd_replay_lock);
+	altmode = bean_hpd_replay_altmode;
+	if (!altmode)
+		return -ENODEV;
+
+	for (i = 0; i < ARRAY_SIZE(altmode->ports); i++) {
+		struct pmic_glink_altmode_port *alt_port = &altmode->ports[i];
+
+		if (!alt_port->bridge || !pmic_glink_altmode_hpd_high(alt_port))
+			continue;
+
+		WRITE_ONCE(alt_port->hpd_replay_ms, ms);
+		queue_work(system_long_wq, &alt_port->hpd_replay_work);
+		queued++;
+	}
+	if (!queued)
+		return -ENXIO;
+
+	*(unsigned int *)kp->arg = ms;
+	return 0;
+}
+
+static void pmic_glink_altmode_clear_replay(void *data)
+{
+	struct pmic_glink_altmode *altmode = data;
+	unsigned int i;
+
+	scoped_guard(mutex, &bean_hpd_replay_lock)
+		if (bean_hpd_replay_altmode == altmode)
+			bean_hpd_replay_altmode = NULL;
+
+	for (i = 0; i < ARRAY_SIZE(altmode->ports); i++)
+		if (altmode->ports[i].bridge)
+			cancel_work_sync(&altmode->ports[i].hpd_replay_work);
 }
 
 static void pmic_glink_altmode_worker(struct work_struct *work)
@@ -616,6 +711,7 @@ static int pmic_glink_altmode_probe(struct auxiliary_device *adev,
 		alt_port->altmode = altmode;
 		alt_port->index = port;
 		INIT_WORK(&alt_port->work, pmic_glink_altmode_worker);
+		INIT_WORK(&alt_port->hpd_replay_work, pmic_glink_altmode_hpd_replay);
 
 		alt_port->bridge = devm_drm_dp_hpd_bridge_alloc(dev, to_of_node(fwnode));
 		if (IS_ERR(alt_port->bridge)) {
@@ -683,6 +779,14 @@ static int pmic_glink_altmode_probe(struct auxiliary_device *adev,
 			continue;
 
 		ret = devm_drm_dp_hpd_bridge_add(dev, alt_port->bridge);
+		if (ret)
+			return ret;
+	}
+
+	if (of_machine_is_compatible("oneplus,infiniti")) {
+		scoped_guard(mutex, &bean_hpd_replay_lock)
+			bean_hpd_replay_altmode = altmode;
+		ret = devm_add_action_or_reset(dev, pmic_glink_altmode_clear_replay, altmode);
 		if (ret)
 			return ret;
 	}

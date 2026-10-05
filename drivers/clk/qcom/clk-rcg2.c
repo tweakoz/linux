@@ -1433,6 +1433,13 @@ static int clk_rcg2_shared_enable(struct clk_hw *hw)
 	if (ret)
 		return ret;
 
+	/* set_rate may be skipped when the boot rate already matches. Ensure
+	 * the declared hardware feedback mode even for an untouched boot cfg,
+	 * before dropping force-enable and relying on the downstream branch.
+	 */
+	if (rcg->hw_clk_ctrl)
+		rcg->parked_cfg |= CFG_HW_CLK_CTRL_MASK;
+
 	/* Write back the stored configuration corresponding to current rate */
 	ret = regmap_write(rcg->clkr.regmap, rcg->cmd_rcgr + CFG_REG, rcg->parked_cfg);
 	if (ret)

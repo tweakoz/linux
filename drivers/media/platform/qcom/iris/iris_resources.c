@@ -6,43 +6,63 @@
 #include <linux/clk.h>
 #include <linux/devfreq.h>
 #include <linux/interconnect.h>
+#include <linux/iris_vpu_bus.h>
+#include <linux/iommu.h>
+#include <linux/of.h>
 #include <linux/pm_domain.h>
 #include <linux/pm_opp.h>
 #include <linux/pm_runtime.h>
 #include <linux/reset.h>
 
 #include "iris_core.h"
+#include "iris_instance.h"
 #include "iris_resources.h"
 
 #define BW_THRESHOLD 50000
 
 int iris_set_icc_bw(struct iris_core *core, unsigned long icc_bw)
 {
-	unsigned long bw_kbps = 0, bw_prev = 0;
-	const struct icc_info *icc_tbl;
-	int ret = 0, i;
-
-	icc_tbl = core->iris_platform_data->icc_tbl;
+	unsigned long bw_kbps, bw_prev = core->power.icc_bw;
+	u32 cfg_prev = 0, mem_prev = 0;
+	const struct icc_info *icc_tbl = core->iris_platform_data->icc_tbl;
+	int cfg = -1, mem = -1, ret, i;
+	bool restore_cfg = false;
 
 	for (i = 0; i < core->icc_count; i++) {
-		if (!strcmp(core->icc_tbl[i].name, "video-mem")) {
-			bw_kbps = icc_bw;
-			bw_prev = core->power.icc_bw;
-
-			bw_kbps = clamp_t(typeof(bw_kbps), bw_kbps,
-					  icc_tbl[i].bw_min_kbps, icc_tbl[i].bw_max_kbps);
-
-			if (abs(bw_kbps - bw_prev) < BW_THRESHOLD && bw_prev)
-				return ret;
-
-			core->icc_tbl[i].avg_bw = bw_kbps;
-
+		if (!strcmp(core->icc_tbl[i].name, "cpu-cfg"))
+			cfg = i;
+		else if (!strcmp(core->icc_tbl[i].name, "video-mem"))
+			mem = i;
+	}
+	/* Power-off clears every vote, including the fixed configuration path. */
+	if (cfg >= 0) {
+		cfg_prev = core->icc_tbl[cfg].avg_bw;
+		restore_cfg = cfg_prev != icc_tbl[cfg].bw_min_kbps;
+		core->icc_tbl[cfg].avg_bw = icc_tbl[cfg].bw_min_kbps;
+	}
+	if (mem >= 0) {
+		mem_prev = core->icc_tbl[mem].avg_bw;
+		bw_kbps = clamp_t(unsigned long, icc_bw,
+				  icc_tbl[mem].bw_min_kbps, icc_tbl[mem].bw_max_kbps);
+		if (abs(bw_kbps - bw_prev) < BW_THRESHOLD && bw_prev) {
+			if (!restore_cfg)
+				return 0;
+			/* Restore configuration without changing the existing memory vote. */
+		} else {
+			core->icc_tbl[mem].avg_bw = bw_kbps;
 			core->power.icc_bw = bw_kbps;
-			break;
 		}
 	}
-
-	return icc_bulk_set_bw(core->icc_count, core->icc_tbl);
+	ret = icc_bulk_set_bw(core->icc_count, core->icc_tbl);
+	if (ret) {
+		if (cfg >= 0)
+			core->icc_tbl[cfg].avg_bw = cfg_prev;
+		if (mem >= 0)
+			core->icc_tbl[mem].avg_bw = mem_prev;
+		/* Bulk failure can unvote earlier paths: force the next full retry. */
+		core->power.icc_bw = 0;
+	}
+	return ret;
 }
 
 int iris_unset_icc_bw(struct iris_core *core)
@@ -137,4 +157,123 @@ int iris_disable_unprepare_clock(struct iris_core *core, enum platform_clk_type 
 	clk_disable_unprepare(clock);
 
 	return 0;
+}
+
+struct iris_context_device {
+	struct device dev;
+	struct device_dma_parameters dma_parms;
+};
+
+static void iris_device_release(struct device *dev)
+{
+	struct iris_context_device *ctx = container_of(dev, struct iris_context_device, dev);
+
+	of_node_put(dev->of_node);
+	kfree(ctx);
+}
+
+int iris_create_child_device_and_map(struct iris_core *core, const struct iris_context_bank *cb)
+{
+	u32 index, region_mask = cb->region_mask;
+	struct iris_context_device *ctx;
+	struct device *dev;
+	int ret;
+
+	ctx = kzalloc_obj(*ctx);
+	if (!ctx)
+		return -ENOMEM;
+
+	dev = &ctx->dev;
+	device_initialize(dev);
+	dev->release = iris_device_release;
+	dev->bus = &iris_vpu_bus_type;
+	dev->parent = core->dev;
+	dev->dma_parms = &ctx->dma_parms;
+	if (cb->of_node_name) {
+		dev->of_node = of_get_child_by_name(core->dev->of_node, cb->of_node_name);
+		if (!dev->of_node) {
+			ret = -EINVAL;
+			goto err_put;
+		}
+	}
+	dev->coherent_dma_mask = core->iris_platform_data->dma_mask;
+	dev->dma_mask = &dev->coherent_dma_mask;
+	dma_set_max_seg_size(dev, DMA_BIT_MASK(32));
+	dma_set_seg_boundary(dev, DMA_BIT_MASK(32));
+
+	ret = dev_set_name(dev, "%s-%s", dev_name(core->dev), cb->name);
+	if (ret)
+		goto err_put;
+	dev_set_drvdata(dev, (void *)cb);
+
+	ret = device_add(dev);
+	if (ret)
+		goto err_put;
+
+	/* The IOMMU bus callback may run before the SMMU supplier is ready. */
+	if (!device_iommu_mapped(dev)) {
+		ret = -EPROBE_DEFER;
+		goto err_unregister;
+	}
+	if (cb->num_stream_ids &&
+	    (!dev_iommu_fwspec_get(dev) ||
+	     dev_iommu_fwspec_get(dev)->num_ids != cb->num_stream_ids)) {
+		ret = -EINVAL;
+		goto err_unregister;
+	}
+
+	while (region_mask) {
+		index = __ffs(region_mask);
+		core->cb_devs[index] = dev;
+		region_mask &= ~BIT(index);
+	}
+
+	return 0;
+
+err_unregister:
+	device_unregister(dev);
+	return dev_err_probe(core->dev, ret, "Failed to map context %s\n", cb->name);
+err_put:
+	put_device(dev);
+	return ret;
+}
+
+enum iris_buffer_region iris_get_region(struct iris_inst *inst, enum iris_buffer_type buffer_type)
+{
+	switch (buffer_type) {
+	case BUF_INPUT:
+		if (inst->domain == ENCODER)
+			return IRIS_PIXEL_REGION;
+		else
+			return IRIS_BITSTREAM_REGION;
+	case BUF_OUTPUT:
+		if (inst->domain == ENCODER)
+			return IRIS_BITSTREAM_REGION;
+		else
+			return IRIS_PIXEL_REGION;
+	case BUF_BIN:
+		return IRIS_BITSTREAM_REGION;
+	case BUF_DPB:
+	case BUF_PARTIAL:
+	case BUF_SCRATCH_2:
+	case BUF_VPSS:
+		return IRIS_PIXEL_REGION;
+	case BUF_ARP:
+	case BUF_COMV:
+	case BUF_LINE:
+	case BUF_NON_COMV:
+	case BUF_PERSIST:
+		return IRIS_NON_PIXEL_REGION;
+	default:
+		dev_err(inst->core->dev, "unknown buffer type: %d\n", buffer_type);
+		return IRIS_UNKNOWN_REGION;
+	}
+}
+
+struct device *iris_get_cb_dev(struct iris_core *core, enum iris_buffer_region region)
+{
+	if (core->cb_devs[region])
+		return core->cb_devs[region];
+
+	return core->dev;
 }

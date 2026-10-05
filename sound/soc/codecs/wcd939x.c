@@ -1795,7 +1795,9 @@ static int wcd939x_get_swr_port(struct snd_kcontrol *kcontrol,
 	struct wcd939x_sdw_priv *wcd = wcd939x->sdw_priv[mixer->shift];
 	unsigned int portidx = wcd->ch_info[mixer->reg].port_num;
 
-	ucontrol->value.integer.value[0] = wcd->port_enable[portidx] ? 1 : 0;
+	ucontrol->value.integer.value[0] =
+		!!(wcd->port_config[portidx - 1].ch_mask &
+		   wcd->ch_info[mixer->reg].ch_mask);
 
 	return 0;
 }

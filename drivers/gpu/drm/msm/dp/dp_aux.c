@@ -4,6 +4,7 @@
  */
 
 #include <linux/delay.h>
+#include <linux/of.h>
 #include <linux/iopoll.h>
 #include <linux/phy/phy.h>
 #include <drm/drm_print.h>
@@ -412,7 +413,8 @@ static ssize_t msm_dp_aux_transfer(struct drm_dp_aux *msm_dp_aux,
 				phy_calibrate(aux->phy);
 		}
 		/* reset aux if link is in connected state */
-		if (msm_dp_aux_is_link_connected(msm_dp_aux))
+		if (msm_dp_aux_is_link_connected(msm_dp_aux) ||
+		    (!aux->is_edp && of_machine_is_compatible("oneplus,infiniti")))
 			msm_dp_aux_reset(aux);
 	} else {
 		aux->retry_cnt = 0;

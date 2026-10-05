@@ -8,7 +8,29 @@
 #	Santosh Yaraganavi <santosh.sy@samsung.com>
 #	Vinayak Holikatti <h.vinayak@samsung.com>
 
+config SCSI_UFS_INFINITI_READONLY
+	bool "Infiniti diagnostic UFS command allowlist"
+	depends on SCSI_UFSHCD=y && !MODULES
+	help
+	  Local diagnostic policy, not an upstream driver feature. Reject all
+	  UFS SCSI commands except enumerated reads and queries except reads
+	  and the device initialization handshake. Force all SCSI disks read
+	  only and prevent BLKROSET from clearing read-only on any block device.
+	  No runtime opt-out. Probe and suspend may fail closed. This does not
+	  prevent firmware-internal maintenance or writes before Linux starts.
+
+config SCSI_UFS_INFINITI_USERDATA_WRITES
+	bool "Allow writes to captured Infiniti userdata range"
+	depends on SCSI_UFS_INFINITI_READONLY
+	help
+	  Destructive experimental mode for one captured CPH2749 layout.
+	  Permit WRITE(10/16) only inside the fixed userdata range on LUN 0
+	  with 4096-byte sectors, plus full-LUN cache synchronization.
+	  All other write/erase/management restrictions remain in force.
+	  Keep disabled for rescue kernels. No runtime opt-out.
+
 config SCSI_UFS_BSG
+	depends on !SCSI_UFS_INFINITI_READONLY
 	bool "Universal Flash Storage BSG device node"
 	select BLK_DEV_BSGLIB
 	help
