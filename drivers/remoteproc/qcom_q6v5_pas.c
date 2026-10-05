@@ -1566,6 +1566,30 @@ static const struct qcom_pas_data sm8450_mpss_resource = {
 	.ssctl_id = 0x12,
 };
 
+/* PSR_AUDIO_PROBE_BEGIN */
+/* Captured PSR firmware is ELF32; explicit manual start only. */
+static const struct qcom_pas_data psr_adsp_probe_resource = {
+	.crash_reason_smem = 423,
+	.firmware_name = "adsp.mdt",
+	.dtb_firmware_name = "adsp_dtb.mdt",
+	.pas_id = 1,
+	.dtb_pas_id = 0x24,
+	.minidump_id = 5,
+	.uses_elf64 = false,
+	.auto_boot = false,
+	.proxy_pd_names = (char*[]){
+		"lcx",
+		"lmx",
+		NULL
+	},
+	.load_state = "adsp",
+	.ssr_name = "lpass",
+	.sysmon_name = "adsp",
+	.ssctl_id = 0x14,
+	.smem_host_id = 2,
+};
+/* PSR_AUDIO_PROBE_END */
+
 static const struct qcom_pas_data sm8550_adsp_resource = {
 	.crash_reason_smem = 423,
 	.firmware_name = "adsp.mdt",
@@ -1845,6 +1869,9 @@ static const struct qcom_pas_data eliza_cdsp_resource = {
 };
 
 static const struct of_device_id qcom_pas_of_match[] = {
+	/* PSR_AUDIO_PROBE_BEGIN */
+	{ .compatible = "oneplus,psr-adsp-probe", .data = &psr_adsp_probe_resource },
+	/* PSR_AUDIO_PROBE_END */
 	{ .compatible = "qcom,eliza-adsp-pas", .data = &sm8550_adsp_resource },
 	{ .compatible = "qcom,eliza-cdsp-pas", .data = &eliza_cdsp_resource },
 	{ .compatible = "qcom,glymur-soccp-pas", .data = &glymur_soccp_resource },

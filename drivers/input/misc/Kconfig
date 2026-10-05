@@ -1035,3 +1035,11 @@ config INPUT_STPMIC1_ONKEY
 	  module will be called stpmic1_onkey.
 
 endif
+
+# BEGIN POD PSR SPMI HAPTICS
+config INPUT_QCOM_SPMI_HAPTICS
+	tristate "Qualcomm SPMI PMIH0108 haptics"
+	depends on MFD_SPMI_PMIC
+	help
+	  Upstream PMIH0108 input force-feedback driver (DIRECT_PLAY/FIFO).
+# END POD PSR SPMI HAPTICS

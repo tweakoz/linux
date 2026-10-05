@@ -3,6 +3,9 @@
  * Copyright (c) 2022-2024 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
+#include <linux/dma-mapping.h>
+#include <linux/io.h>
+#include <linux/of.h>
 #include <media/v4l2-mem2mem.h>
 
 #include "iris_hfi_gen2.h"
@@ -272,6 +275,65 @@ static int iris_hfi_gen2_handle_session_error(struct iris_inst *inst,
 	return 0;
 }
 
+/* Called with core->lock held, before recovery can release SFR memory. */
+static void iris_hfi_gen2_log_sfr(struct iris_core *core)
+{
+	const char *reason;
+	size_t length, offset, count;
+	u32 size;
+	char chunk[257];
+
+	if (!core->sfr_vaddr)
+		return;
+
+	/* Coherent firmware DMA precedes its failure notification. */
+	dma_rmb();
+	size = READ_ONCE(*(u32 *)core->sfr_vaddr);
+	if (size != SFR_SIZE) {
+		dev_err(core->dev, "SFR invalid size %u (allocation %u)\n", size, SFR_SIZE);
+		return;
+	}
+
+	reason = (const char *)core->sfr_vaddr + sizeof(u32);
+	length = strnlen(reason, SFR_SIZE - sizeof(u32));
+	dev_err(core->dev, "SFR reason bytes=%zu terminated=%u\n", length,
+		(unsigned int)(length < SFR_SIZE - sizeof(u32)));
+	/* Bounded chunks avoid printk truncation; never alter firmware memory. */
+	for (offset = 0; offset < length; offset += count) {
+		count = min_t(size_t, sizeof(chunk) - 1, length - offset);
+		memcpy(chunk, reason + offset, count);
+		chunk[count] = '\0';
+		dev_err(core->dev, "SFR[%zu]: %s\n", offset, chunk);
+	}
+}
+
+/* OEM Iris4 NoC fatal diagnostic: read only, while existing core lock is held. */
+static void iris_psr_log_noc(struct iris_core *core)
+{
+	static const u32 offsets[] = {
+		0x1a020, 0x1a024, 0x1a028, 0x1a02c,
+		0x1a030, 0x1a034, 0x1a038, 0x1a03c,
+	};
+	u32 power, value;
+	unsigned int i;
+
+	if (!of_device_is_compatible(core->dev->of_node, "qcom,kaanapali-iris"))
+		return;
+	/* OEM WRAPPER_CORE_POWER_STATUS: bit1 means hardware powered on. */
+	power = readl(core->reg_base + 0xb0080);
+	dev_err(core->dev, "PSR fatal CORE_POWER_STATUS=%#x\n", power);
+	if (!(power & BIT(1))) {
+		dev_err(core->dev, "PSR fatal NoC skipped: hardware power collapsed\n");
+		return;
+	}
+	/* Exact OEM ERRLOG0..3 low/high reads; never ERRCLR or MAINCTL. */
+	for (i = 0; i < ARRAY_SIZE(offsets); i++) {
+		value = readl(core->reg_base + offsets[i]);
+		dev_err(core->dev, "PSR fatal NOC offset=%#x value=%#x\n",
+			offsets[i], value);
+	}
+}
+
 static int iris_hfi_gen2_handle_system_error(struct iris_core *core,
 					     struct iris_hfi_packet *pkt)
 {
@@ -283,6 +345,8 @@ static int iris_hfi_gen2_handle_system_error(struct iris_core *core,
 	core->state = IRIS_CORE_ERROR;
 
 	mutex_lock(&core->lock);
+	iris_psr_log_noc(core);
+	iris_hfi_gen2_log_sfr(core);
 	list_for_each_entry(instance, &core->instances, list)
 		iris_inst_change_state(instance, IRIS_INST_ERROR);
 	mutex_unlock(&core->lock);
@@ -1004,7 +1068,10 @@ static void iris_hfi_gen2_flush_debug_queue(struct iris_core *core, u8 *packet)
 
 		packet[pkt->size] = '\0';
 		log = (u8 *)packet + sizeof(*pkt) + 1;
-		dev_dbg(core->dev, "%s", log);
+		if (pkt->debug_level & HFI_DEBUG_LOG_ERROR_FATAL)
+			dev_warn(core->dev, "firmware: %s", log);
+		else
+			dev_dbg(core->dev, "%s", log);
 	}
 }
 

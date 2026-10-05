@@ -217,6 +217,17 @@ config BATTERY_QCOM_BATTMGR
 	  which is used on modern Qualcomm platforms to provide battery and
 	  power supply information.
 
+config OPLUS_INFINITI_TELEMETRY
+	bool "Infiniti telemetry and conservative charging (experimental)"
+	depends on QCOM_PMIC_GLINK=y
+	depends on !BATTERY_QCOM_BATTMGR && !BATTERY_OPLUS_BATTMGR
+	help
+	  Board-specific telemetry and standard battery/USB power supplies.
+	  Charging is opt-in with fixed conservative current/voltage limits
+	  and kernel polling. No OTG, fast-charge, gauge-init or persistent
+	  configuration writes. This is experimental, not a complete charger
+	  policy; suspend is blocked while this charging mode is enabled.
+
 config BATTERY_OPLUS_BATTMGR
 	tristate "OnePlus PMIC GLINK battery manager support"
 	depends on QCOM_PMIC_GLINK

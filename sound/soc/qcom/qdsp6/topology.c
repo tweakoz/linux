@@ -973,9 +973,14 @@ static int audioreach_pga_event(struct snd_soc_dapm_widget *w,
 
 	switch (event) {
 	case SND_SOC_DAPM_POST_PMU:
-		/* apply gain after power up of widget */
-		audioreach_gain_set_vol_ctrl(apm, mod, mod->gain);
-		break;
+		/* PSR playback diagnostic: report actual DSP acceptance. */
+		{
+			int ret = audioreach_gain_set_vol_ctrl(apm, mod, mod->gain);
+
+			dev_info(c->dev, "PSR PGA gain: iid=0x%x gain=%u result=%d\n",
+				 mod->instance_id, mod->gain, ret);
+			return ret;
+		}
 	default:
 		break;
 	}

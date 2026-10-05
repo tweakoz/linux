@@ -15,6 +15,7 @@
 #include "iris_platform_common.h"
 #include "iris_resources.h"
 #include "iris_state.h"
+#include "iris_psr_llcc.h"
 
 struct icc_info {
 	const char		*name;
@@ -36,6 +37,7 @@ struct qcom_ubwc_cfg_data;
  * struct iris_core - holds core parameters valid for all instances
  *
  * @dev: reference to device structure
+ * @cb_devs: array of context bank devices (eg: bitstream, non-pixel, pixel, etc)
  * @reg_base: IO memory base address
  * @irq: iris irq
  * @v4l2_dev: a holder for v4l2 device structure
@@ -81,6 +83,7 @@ struct qcom_ubwc_cfg_data;
 
 struct iris_core {
 	struct device				*dev;
+	struct device				*cb_devs[IRIS_MAX_REGION];
 	void __iomem				*reg_base;
 	int					irq;
 	struct v4l2_device			v4l2_dev;
@@ -115,6 +118,7 @@ struct iris_core {
 	u32					header_id;
 	u32					packet_id;
 	struct iris_core_power			power;
+	struct iris_psr_llcc psr_llcc;
 	const struct iris_hfi_sys_ops		*hfi_sys_ops;
 	struct completion			core_init_done;
 	u32					intr_status;

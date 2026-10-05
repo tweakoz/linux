@@ -42,12 +42,19 @@ static int iris_hfi_gen2_sys_image_version(struct iris_core *core)
 	struct iris_hfi_header *hdr;
 	int ret;
 
-	hdr = kzalloc(SYS_NO_PAYLOAD_PKT_SIZE, GFP_KERNEL);
+	hdr = kzalloc(sizeof(*hdr) + 2 * (sizeof(struct iris_hfi_packet) + sizeof(u32)),
+		      GFP_KERNEL);
 	if (!hdr)
 		return -ENOMEM;
 
 	iris_hfi_gen2_packet_image_version(core, hdr);
 	ret = iris_hfi_queue_cmd_write_locked(core, hdr, hdr->size);
+
+	if (!ret) {
+		iris_hfi_gen2_packet_psr_debug(core, hdr);
+		ret = iris_hfi_queue_cmd_write_locked(core, hdr, hdr->size);
+		dev_info(core->dev, "PSR firmware error/fatal log request: result=%d\n", ret);
+	}
 
 	kfree(hdr);
 

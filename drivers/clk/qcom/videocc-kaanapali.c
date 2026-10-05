@@ -388,7 +388,7 @@ static struct clk_mem_branch video_cc_mvs0_freerun_clk = {
 				},
 				.num_parents = 1,
 				.flags = CLK_SET_RATE_PARENT,
-				.ops = &clk_branch2_ops,
+				.ops = &clk_branch2_mem_ops,
 			},
 		},
 	},
