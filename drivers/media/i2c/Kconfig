@@ -1814,3 +1814,31 @@ config VIDEO_MAX96717
 endmenu
 
 endif # VIDEO_DEV
+
+config VIDEO_PSR_IMX709
+	tristate "PSR captured IMX709 controls-v2 (experimental)"
+	depends on I2C && VIDEO_DEV
+	select V4L2_FWNODE
+	select VIDEO_V4L2_SUBDEV_API
+	select REGMAP_I2C
+
+config VIDEO_PSR_IMX906
+	tristate "PSR captured IMX906 controls-v2 (experimental)"
+	depends on I2C && VIDEO_DEV
+	select V4L2_FWNODE
+	select VIDEO_V4L2_SUBDEV_API
+	select REGMAP_I2C
+
+config VIDEO_PSR_OV50D40
+	tristate "PSR captured OV50D40 controls-v2 (experimental)"
+	depends on I2C && VIDEO_DEV
+	select V4L2_FWNODE
+	select VIDEO_V4L2_SUBDEV_API
+	select REGMAP_I2C
+
+config VIDEO_PSR_S5KJN5
+	tristate "PSR captured S5KJN5 controls-v2 (experimental)"
+	depends on I2C && VIDEO_DEV
+	select V4L2_FWNODE
+	select VIDEO_V4L2_SUBDEV_API
+	select REGMAP_I2C

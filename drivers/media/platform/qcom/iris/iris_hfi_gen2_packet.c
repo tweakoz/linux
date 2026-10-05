@@ -4,6 +4,7 @@
  */
 
 #include <linux/printk.h>
+#include <linux/soc/qcom/llcc-qcom.h>
 #include <linux/soc/qcom/ubwc.h>
 
 #include "iris_hfi_common.h"
@@ -211,6 +212,20 @@ void iris_hfi_gen2_packet_sys_init(struct iris_core *core, struct iris_hfi_heade
 				    sizeof(u32));
 }
 
+void iris_hfi_gen2_packet_psr_debug(struct iris_core *core, struct iris_hfi_header *hdr)
+{
+	u32 payload = 0; /* OEM HFI_DEBUG_CONFIG_DEFAULT: no WFI/CRC/watchdog changes. */
+
+	iris_hfi_gen2_create_header(hdr, 0, core->header_id++);
+	iris_hfi_gen2_create_packet(hdr, HFI_PROP_DEBUG_CONFIG,
+				    HFI_HOST_FLAGS_NONE, HFI_PAYLOAD_U32_ENUM,
+				    HFI_PORT_NONE, core->packet_id++, &payload, sizeof(payload));
+	payload = HFI_DEBUG_LOG_ERROR_FATAL;
+	iris_hfi_gen2_create_packet(hdr, HFI_PROP_DEBUG_LOG_LEVEL,
+				    HFI_HOST_FLAGS_NONE, HFI_PAYLOAD_U32_ENUM,
+				    HFI_PORT_NONE, core->packet_id++, &payload, sizeof(payload));
+}
+
 void iris_hfi_gen2_packet_image_version(struct iris_core *core, struct iris_hfi_header *hdr)
 {
 	iris_hfi_gen2_create_header(hdr, 0, core->header_id++);
@@ -293,4 +308,24 @@ void iris_hfi_gen2_packet_sys_pc_prep(struct iris_core *core, struct iris_hfi_he
 				    HFI_PORT_NONE,
 				    core->packet_id++,
 				    NULL, 0);
+}
+
+void iris_hfi_gen2_packet_psr_subcaches(struct iris_core *core, struct iris_hfi_header *hdr)
+{
+ static const u32 subtypes[] = { 1, 2, 4, 5 };
+ struct iris_psr_llcc *cache = &core->psr_llcc;
+ unsigned int i;
+
+ iris_hfi_gen2_create_header(hdr, 0, core->header_id++);
+ for (i = 0; i < cache->count; i++) {
+  struct iris_hfi_buffer buf = { 0 };
+
+  buf.type = HFI_BUFFER_SUBCACHE;
+  buf.index = cache->desc[i]->slice_id;
+  buf.buffer_size = cache->desc[i]->slice_size;
+  /* Exact OEM hfi_buffer.u.subtype offset44; retain ordinary buffer ABI. */
+  buf.reserved[0] = subtypes[i];
+  iris_hfi_gen2_create_packet(hdr, HFI_CMD_BUFFER, HFI_HOST_FLAGS_NONE,
+          HFI_PAYLOAD_STRUCTURE, HFI_PORT_NONE, core->packet_id++, &buf, sizeof(buf));
+ }
 }

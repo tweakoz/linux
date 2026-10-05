@@ -54,6 +54,7 @@ extern const struct iris_firmware_data iris_hfi_gen1_data;
 extern const struct iris_firmware_data iris_hfi_gen2_data;
 extern const struct iris_firmware_data iris_hfi_milos_data;
 
+extern const struct iris_platform_data kaanapali_data;
 extern const struct iris_platform_data milos_data;
 extern const struct iris_platform_data qcs8300_data;
 extern const struct iris_platform_data sc7280_data;
@@ -231,6 +232,26 @@ struct icc_vote_data {
 	u32 fps;
 };
 
+enum iris_buffer_region {
+	IRIS_UNKNOWN_REGION,
+	IRIS_BITSTREAM_REGION,
+	IRIS_NON_PIXEL_REGION,
+	IRIS_PIXEL_REGION,
+	IRIS_SECURE_BITSTREAM_REGION,
+	IRIS_SECURE_NON_PIXEL_REGION,
+	IRIS_SECURE_PIXEL_REGION,
+	IRIS_FIRMWARE_REGION,
+	IRIS_MAX_REGION,
+};
+
+struct iris_context_bank {
+	char *name;
+	const char *of_node_name;
+	u32 num_stream_ids;
+	u32 f_id;
+	u32 region_mask;
+};
+
 enum platform_pm_domain_type {
 	IRIS_CTRL_POWER_DOMAIN,
 	IRIS_HW_POWER_DOMAIN,
@@ -291,7 +312,14 @@ struct iris_firmware_desc {
 	const char *fwname;
 };
 
+struct iris_reg_preset {
+	u32 reg;
+	u32 value;
+};
+
 struct iris_platform_data {
+	const struct iris_reg_preset *reg_presets;
+	u32 num_reg_presets;
 	const struct iris_firmware_desc *firmware_desc_gen1, *firmware_desc_gen2;
 
 	const struct vpu_ops *vpu_ops;
@@ -316,6 +344,8 @@ struct iris_platform_data {
 	struct platform_inst_caps *inst_caps;
 	const struct tz_cp_config *tz_cp_config_data;
 	u32 tz_cp_config_data_size;
+	const struct iris_context_bank *cb_data;
+	u32 cb_data_size;
 	u32 num_vpp_pipe;
 	bool no_aon;
 	u32 max_session_count;

@@ -1154,12 +1154,39 @@ static int qcom_pcie_config_sid_1_9_0(struct qcom_pcie *pcie)
 	struct device *dev = pcie->pci->dev;
 	u8 qcom_pcie_crc8_table[CRC8_TABLE_SIZE];
 	int i, nr_map, size = 0;
+	const __be32 *raw_map;
+	struct device_node *iommu;
+	u32 cells = 1, stride = 4;
 	u32 smmu_sid_base;
 	u32 val;
 
-	of_get_property(dev->of_node, "iommu-map", &size);
+	raw_map = of_get_property(dev->of_node, "iommu-map", &size);
 	if (!size)
 		return 0;
+	if (size < 4 * sizeof(u32) || size % sizeof(u32))
+		return -EINVAL;
+
+	/* arm-smmu can supply SID + mask, giving five cells per entry.
+	 * Keep the historical four-cell form used by existing Qualcomm DTs.
+	 */
+	iommu = of_find_node_by_phandle(be32_to_cpup(raw_map + 1));
+	if (!iommu)
+		return -EINVAL;
+	of_property_read_u32(iommu, "#iommu-cells", &cells);
+	of_node_put(iommu);
+	if (cells == 2) {
+		bool legacy = !(size % (4 * sizeof(u32)));
+
+		for (i = 0; legacy && i < size / sizeof(u32); i += 4)
+			legacy = raw_map[i + 1] == raw_map[1] &&
+				 raw_map[i + 3] == cpu_to_be32(1);
+		if (!legacy)
+			stride = 5;
+	} else if (cells != 1) {
+		return -EINVAL;
+	}
+	if (size % (stride * sizeof(u32)))
+		return -EINVAL;
 
 	/* Enable BDF to SID translation by disabling bypass mode (default) */
 	val = readl(pcie->parf + PARF_BDF_TO_SID_CFG);
@@ -1170,10 +1197,23 @@ static int qcom_pcie_config_sid_1_9_0(struct qcom_pcie *pcie)
 	if (!map)
 		return -ENOMEM;
 
-	of_property_read_u32_array(dev->of_node, "iommu-map", (u32 *)map,
-				   size / sizeof(u32));
+	nr_map = size / (stride * sizeof(u32));
+	for (i = 0; i < nr_map; i++) {
+		const __be32 *entry = raw_map + i * stride;
 
-	nr_map = size / (sizeof(*map));
+		map[i].bdf = be32_to_cpup(entry);
+		map[i].phandle = be32_to_cpup(entry + 1);
+		map[i].smmu_sid = be32_to_cpup(entry + 2);
+		map[i].smmu_sid_len = be32_to_cpup(entry + stride - 1);
+		/* A nonzero mask cannot describe one fixed hardware SID. */
+		if (entry[1] != raw_map[1] ||
+		    (stride == 5 && be32_to_cpup(entry + 3))) {
+			kfree(map);
+			return -EINVAL;
+		}
+	}
+	dev_info(dev, "BDF/SID table: %d entries, %u cells per entry\n",
+		 nr_map, stride);
 
 	crc8_populate_msb(qcom_pcie_crc8_table, QCOM_PCIE_CRC8_POLYNOMIAL);
 

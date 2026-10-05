@@ -538,6 +538,8 @@ static int blkdev_roset(struct block_device *bdev, unsigned cmd,
 
 	if (get_user(n, (int __user *)arg))
 		return -EFAULT;
+	if (IS_ENABLED(CONFIG_SCSI_UFS_INFINITI_READONLY) && !n)
+		return -EPERM;
 	if (bdev->bd_disk->fops->set_read_only) {
 		ret = bdev->bd_disk->fops->set_read_only(bdev, n);
 		if (ret)
