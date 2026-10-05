@@ -286,9 +286,9 @@ void iris_hfi_gen2_packet_sys_interframe_powercollapse(struct iris_core *core,
 {
 	u32 payload = 1; /* HFI_TRUE; unchanged on other platforms. */
 
-	/* PSR diagnostic: isolate autonomous firmware power-off from codec work. */
+	/* Restore the OEM IFPC enable paired with the existing hardware handoff. */
 	if (of_device_is_compatible(core->dev->of_node, "qcom,kaanapali-iris")) {
-		payload = 0;
+		payload = 1;
 		dev_info(core->dev, "PSR experimental HFI_PROP_INTRA_FRAME_POWER_COLLAPSE=%u header_id=%u\n",
 			 payload, core->header_id);
 	}
