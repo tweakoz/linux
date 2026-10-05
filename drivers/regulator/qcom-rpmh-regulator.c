@@ -481,6 +481,31 @@ static const struct regulator_ops rpmh_regulator_xob_ops = {
 	.is_enabled		= rpmh_regulator_is_enabled,
 };
 
+/* PSR's stock L16B_E0 contract is a nominal 3300 mV RPMh vote.
+ * This describes the vote API, not physical LDO voltage resolution.
+ */
+static const struct linear_range psr_l16_nominal_voltage[] = {
+	REGULATOR_LINEAR_RANGE(3300000, 0, 0, 0),
+};
+
+static void rpmh_regulator_psr_l16_nominal(struct rpmh_vreg *vreg,
+		struct device *dev, struct device_node *node,
+		const char *pmic_id, const char *resource,
+		const struct regulator_init_data *init_data)
+{
+	if (!of_machine_is_compatible("oneplus,infiniti") ||
+	    !of_device_is_compatible(dev->of_node, "qcom,pmh0101-rpmh-regulators") ||
+	    strcmp(pmic_id, "B_E0") || !of_node_name_eq(node, "ldo16") ||
+	    strcmp(resource, "L16B_E0") ||
+	    init_data->constraints.min_uV != 3300000 ||
+	    init_data->constraints.max_uV != 3300000)
+		return;
+
+	vreg->rdesc.linear_ranges = psr_l16_nominal_voltage;
+	vreg->rdesc.n_linear_ranges = ARRAY_SIZE(psr_l16_nominal_voltage);
+	vreg->rdesc.n_voltages = 1;
+}
+
 /**
  * rpmh_regulator_init_vreg() - initialize all attributes of an rpmh-regulator
  * @vreg:		Pointer to the individual rpmh-regulator resource
@@ -560,6 +585,9 @@ static int rpmh_regulator_init_vreg(struct rpmh_vreg *vreg, struct device *dev,
 	init_data = of_get_regulator_init_data(dev, node, &vreg->rdesc);
 	if (!init_data)
 		return -ENOMEM;
+
+	rpmh_regulator_psr_l16_nominal(vreg, dev, node, pmic_id,
+					rpmh_resource_name, init_data);
 
 	if (rpmh_data->hw_data->regulator_type == XOB &&
 	    init_data->constraints.min_uV &&
