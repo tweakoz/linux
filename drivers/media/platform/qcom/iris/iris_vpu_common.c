@@ -169,6 +169,8 @@ skip_power_off:
 	ctrl_status = readl(core->reg_base + CTRL_STATUS);
 	wfi_status = readl(core->reg_base + WRAPPER_TZ_CPU_STATUS);
 	wfi_status &= BIT(0);
+	if (wfi_status && !(ctrl_status & BIT(30)))
+		iris_psr_log_stall(core, ctrl_status, wfi_status);
 	dev_err(core->dev, "skip power collapse, wfi=%#x, idle=%#x, pcr=%#x, ctrl=%#x)\n",
 		wfi_status, idle_status, pc_ready, ctrl_status);
 

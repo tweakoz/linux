@@ -3,7 +3,9 @@
  * Copyright (c) 2025 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
+#include <linux/atomic.h>
 #include <linux/iopoll.h>
+#include <linux/of.h>
 #include <linux/reset.h>
 
 #include "iris_instance.h"
@@ -91,6 +93,13 @@ disable_apv_hw_power_domain:
 
 static void iris_vpu4x_power_off_apv(struct iris_core *core)
 {
+	static atomic_t records = ATOMIC_INIT(0);
+	bool trace = of_device_is_compatible(core->dev->of_node, "qcom,kaanapali-iris") &&
+		     atomic_add_unless(&records, 1, 8);
+	u32 lpi_seen = 0, req_seen = 0, clear_seen = 0;
+	int lpi_ret = -ENODATA, req_ret = -ENODATA;
+	int clear_ret = -ENODATA;
+	bool pulse = false, bridge = false;
 	bool handshake_done, handshake_busy;
 	u32 value, count = 0;
 	int ret;
@@ -122,6 +131,8 @@ static void iris_vpu4x_power_off_apv(struct iris_core *core)
 	/* OEM requires final DONE even when the initial status was not busy. */
 	ret = readl_poll_timeout(core->reg_base + AON_WRAPPER_MVP_NOC_LPI_STATUS,
 				 value, value & NOC_LPI_STATUS_DONE, 200, 2000);
+	lpi_ret = ret;
+	lpi_seen = value;
 	if (ret)
 		dev_err(core->dev, "LPI completion timeout\n");
 	/* Release only this request before the reset handshake. */
@@ -132,14 +143,19 @@ static void iris_vpu4x_power_off_apv(struct iris_core *core)
 	writel(0x080200, core->reg_base + AON_WRAPPER_MVP_NOC_RESET_REQ);
 	ret = readl_poll_timeout(core->reg_base + AON_WRAPPER_MVP_NOC_RESET_ACK,
 				 value, value == 0x080200, 200, 2000);
+	req_ret = ret;
+	req_seen = value;
 	if (ret)
 		goto disable_clocks_and_power;
 
 	writel(0x080200, core->reg_base + AON_WRAPPER_MVP_NOC_RESET_SYNCRST);
 	writel(0x0, core->reg_base + AON_WRAPPER_MVP_NOC_RESET_SYNCRST);
+	pulse = true;
 	writel(0x0, core->reg_base + AON_WRAPPER_MVP_NOC_RESET_REQ);
 	ret = readl_poll_timeout(core->reg_base + AON_WRAPPER_MVP_NOC_RESET_ACK,
 				 value, value == 0x0, 200, 2000);
+	clear_ret = ret;
+	clear_seen = value;
 	if (ret)
 		goto disable_clocks_and_power;
 
@@ -148,7 +164,13 @@ static void iris_vpu4x_power_off_apv(struct iris_core *core)
 	writel(CORE_BRIDGE_HW_RESET_DISABLE, core->reg_base + CPU_CS_APV_BRIDGE_SYNC_RESET);
 	writel(0x0, core->reg_base + CPU_CS_APV_BRIDGE_SYNC_RESET);
 
+	bridge = true;
+
 disable_clocks_and_power:
+	if (trace)
+		dev_err(core->dev, "PSR shutdown apv lpi=%d/%#x req=%d/%#x pulse=%u clear=%d/%#x bridge=%u\n",
+			lpi_ret, lpi_seen, req_ret,
+			req_seen, pulse, clear_ret, clear_seen, bridge);
 	iris_disable_unprepare_clock(core, IRIS_APV_HW_CLK);
 	iris_disable_power_domains(core, core->pmdomain_tbl->pd_devs[IRIS_APV_HW_POWER_DOMAIN]);
 }
@@ -286,6 +308,13 @@ disable_hw_power_domain:
 static void iris_vpu4x_power_off_hardware(struct iris_core *core)
 {
 	u32 efuse_value = readl(core->reg_base + WRAPPER_EFUSE_MONITOR);
+	static atomic_t records = ATOMIC_INIT(0);
+	bool trace = of_device_is_compatible(core->dev->of_node, "qcom,kaanapali-iris") &&
+		     atomic_add_unless(&records, 1, 8);
+	u32 power_seen = 0, idle_seen = 0, lpi_seen = 0, req_seen = 0, clear_seen = 0;
+	int idle_ret = -ENODATA, lpi_ret = -ENODATA, req_ret = -ENODATA;
+	int clear_ret = -ENODATA;
+	bool pulse = false, bridge = false;
 	bool handshake_done, handshake_busy;
 	u32 value, count = 0;
 	int ret;
@@ -296,6 +325,7 @@ static void iris_vpu4x_power_off_hardware(struct iris_core *core)
 		iris_vpu4x_power_off_apv(core);
 
 	value = readl(core->reg_base + WRAPPER_CORE_POWER_STATUS);
+	power_seen = value;
 
 	if (!(value & CORE_PWR_ON))
 		goto disable_clocks_and_power;
@@ -305,8 +335,9 @@ static void iris_vpu4x_power_off_hardware(struct iris_core *core)
 	if (value & CORE_CLK_HALT)
 		writel(0x0, core->reg_base + WRAPPER_CORE_CLOCK_CONFIG);
 
-	readl_poll_timeout(core->reg_base + VCODEC_SS_IDLE_STATUSN, value,
+	idle_ret = readl_poll_timeout(core->reg_base + VCODEC_SS_IDLE_STATUSN, value,
 			   (value & VPU_IDLE_BITS) == VPU_IDLE_BITS, 2000, 20000);
+	idle_seen = value;
 
 	do {
 		writel(REQ_POWER_DOWN_PREP, core->reg_base + AON_WRAPPER_MVP_NOC_LPI_CONTROL);
@@ -330,6 +361,8 @@ static void iris_vpu4x_power_off_hardware(struct iris_core *core)
 	/* OEM requires final DONE even when the initial status was not busy. */
 	ret = readl_poll_timeout(core->reg_base + AON_WRAPPER_MVP_NOC_LPI_STATUS,
 				 value, value & NOC_LPI_STATUS_DONE, 200, 2000);
+	lpi_ret = ret;
+	lpi_seen = value;
 	if (ret)
 		dev_err(core->dev, "LPI completion timeout\n");
 	/* Release only this request before the reset handshake. */
@@ -340,14 +373,19 @@ static void iris_vpu4x_power_off_hardware(struct iris_core *core)
 	writel(MVP_NOC_RESET_REQ_MASK, core->reg_base + AON_WRAPPER_MVP_NOC_RESET_REQ);
 	ret = readl_poll_timeout(core->reg_base + AON_WRAPPER_MVP_NOC_RESET_ACK,
 				 value, value == MVP_NOC_RESET_REQ_MASK, 200, 2000);
+	req_ret = ret;
+	req_seen = value;
 	if (ret)
 		goto disable_clocks_and_power;
 
 	writel(MVP_NOC_RESET_REQ_MASK, core->reg_base + AON_WRAPPER_MVP_NOC_RESET_SYNCRST);
 	writel(0x0, core->reg_base + AON_WRAPPER_MVP_NOC_RESET_SYNCRST);
+	pulse = true;
 	writel(0x0, core->reg_base + AON_WRAPPER_MVP_NOC_RESET_REQ);
 	ret = readl_poll_timeout(core->reg_base + AON_WRAPPER_MVP_NOC_RESET_ACK,
 				 value, value == 0x0, 200, 2000);
+	clear_ret = ret;
+	clear_seen = value;
 	if (ret)
 		goto disable_clocks_and_power;
 
@@ -356,7 +394,13 @@ static void iris_vpu4x_power_off_hardware(struct iris_core *core)
 	writel(CORE_BRIDGE_HW_RESET_DISABLE, core->reg_base + CPU_CS_AHB_BRIDGE_SYNC_RESET);
 	writel(0x0, core->reg_base + CPU_CS_AHB_BRIDGE_SYNC_RESET);
 
+	bridge = true;
+
 disable_clocks_and_power:
+	if (trace)
+		dev_err(core->dev, "PSR shutdown main power=%#x idle=%d/%#x lpi=%d/%#x req=%d/%#x pulse=%u clear=%d/%#x bridge=%u efuse=%#x\n",
+			power_seen, idle_ret, idle_seen, lpi_ret, lpi_seen, req_ret,
+			req_seen, pulse, clear_ret, clear_seen, bridge, efuse_value);
 	iris_vpu4x_disable_hardware_clocks(core, efuse_value);
 
 	if (!(efuse_value & DISABLE_VIDEO_VPP1_BIT))

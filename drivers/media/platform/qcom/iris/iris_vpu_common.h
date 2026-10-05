@@ -44,4 +44,6 @@ u64 iris_vpu3x_vpu4x_calculate_frequency(struct iris_inst *inst, size_t data_siz
 
 void iris_vpu_set_preset_registers(struct iris_core *core);
 
+void iris_psr_log_stall(struct iris_core *core, u32 ctrl, u32 wfi);
+
 #endif
