@@ -131,6 +131,55 @@ static int iris_init_resets(struct iris_core *core)
 				     core->iris_platform_data->controller_rst_tbl_size);
 }
 
+static void iris_destroy_child_device(struct iris_core *core, const struct iris_context_bank *cb)
+{
+	u32 index, region_mask = cb->region_mask;
+	struct device *dev = NULL;
+
+	while (region_mask) {
+		index = __ffs(region_mask);
+		dev = core->cb_devs[index];
+		core->cb_devs[index] = NULL;
+		region_mask &= ~BIT(index);
+	}
+
+	if (dev)
+		device_unregister(dev);
+}
+
+static void iris_deinit_context_bank_devices(struct iris_core *core)
+{
+	const struct iris_context_bank *cb;
+	int i;
+
+	for (i = 0; i < core->iris_platform_data->cb_data_size; i++) {
+		cb = &core->iris_platform_data->cb_data[i];
+		iris_destroy_child_device(core, cb);
+	}
+}
+
+static int iris_init_context_bank_devices(struct iris_core *core)
+{
+	const struct iris_context_bank *cb;
+	int ret, i;
+
+	for (i = 0; i < core->iris_platform_data->cb_data_size; i++) {
+		cb = &core->iris_platform_data->cb_data[i];
+
+		ret = iris_create_child_device_and_map(core, cb);
+		if (ret)
+			goto err_deinit_cb;
+	}
+
+	return 0;
+
+err_deinit_cb:
+	while (i-- > 0)
+		iris_destroy_child_device(core, &core->iris_platform_data->cb_data[i]);
+
+	return ret;
+}
+
 static int iris_init_resources(struct iris_core *core)
 {
 	int ret;
@@ -178,11 +227,10 @@ static int iris_register_video_device(struct iris_core *core, enum domain_type t
 		goto err_vdev_release;
 	}
 
+	video_set_drvdata(vdev, core);
 	ret = video_register_device(vdev, VFL_TYPE_VIDEO, -1);
 	if (ret)
 		goto err_vdev_release;
-
-	video_set_drvdata(vdev, core);
 
 	return 0;
 
@@ -190,6 +238,12 @@ err_vdev_release:
 	video_device_release(vdev);
 
 	return ret;
+}
+
+static void iris_disable_runtime_pm(void *data)
+{
+	pm_runtime_dont_use_autosuspend(data);
+	pm_runtime_disable(data);
 }
 
 static void iris_remove(struct platform_device *pdev)
@@ -201,6 +255,8 @@ static void iris_remove(struct platform_device *pdev)
 		return;
 
 	iris_core_deinit(core);
+	devm_release_action(core->dev, iris_disable_runtime_pm, core->dev);
+	iris_deinit_context_bank_devices(core);
 
 	video_unregister_device(core->vdev_dec);
 	video_unregister_device(core->vdev_enc);
@@ -256,6 +312,10 @@ static int iris_probe(struct platform_device *pdev)
 	if (IS_ERR(core->ubwc_cfg))
 		return PTR_ERR(core->ubwc_cfg);
 
+	ret = iris_psr_llcc_probe(core);
+	if (ret)
+		return ret;
+
 	ret = devm_request_threaded_irq(core->dev, core->irq, iris_hfi_isr,
 					iris_hfi_isr_handler,
 					IRQF_TRIGGER_HIGH | IRQF_NO_AUTOEN,
@@ -269,43 +329,48 @@ static int iris_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 
-	ret = v4l2_device_register(dev, &core->v4l2_dev);
+	/* Establish DMA contexts before publishing any userspace video node. */
+	ret = iris_init_context_bank_devices(core);
 	if (ret)
 		return ret;
 
-	ret = iris_register_video_device(core, DECODER);
-	if (ret)
-		goto err_v4l2_unreg;
-
-	ret = iris_register_video_device(core, ENCODER);
-	if (ret)
-		goto err_vdev_unreg_dec;
-
 	platform_set_drvdata(pdev, core);
-
 	dma_mask = core->iris_platform_data->dma_mask;
-
-	ret = dma_set_mask_and_coherent(dev, dma_mask);
-	if (ret)
-		goto err_vdev_unreg_enc;
-
+	if (device_iommu_mapped(core->dev)) {
+		ret = dma_set_mask_and_coherent(core->dev, dma_mask);
+		if (ret)
+			goto err_deinit_cb;
+	}
 	dma_set_max_seg_size(&pdev->dev, DMA_BIT_MASK(32));
 	dma_set_seg_boundary(&pdev->dev, DMA_BIT_MASK(32));
 
 	pm_runtime_set_autosuspend_delay(core->dev, AUTOSUSPEND_DELAY_VALUE);
 	pm_runtime_use_autosuspend(core->dev);
-	ret = devm_pm_runtime_enable(core->dev);
+	pm_runtime_enable(core->dev);
+	ret = devm_add_action_or_reset(core->dev, iris_disable_runtime_pm, core->dev);
 	if (ret)
-		goto err_vdev_unreg_enc;
+		goto err_deinit_cb;
+
+	ret = v4l2_device_register(dev, &core->v4l2_dev);
+	if (ret)
+		goto err_disable_pm;
+	ret = iris_register_video_device(core, DECODER);
+	if (ret)
+		goto err_v4l2_unreg;
+	ret = iris_register_video_device(core, ENCODER);
+	if (ret)
+		goto err_vdev_unreg_dec;
 
 	return 0;
 
-err_vdev_unreg_enc:
-	video_unregister_device(core->vdev_enc);
 err_vdev_unreg_dec:
 	video_unregister_device(core->vdev_dec);
 err_v4l2_unreg:
 	v4l2_device_unregister(&core->v4l2_dev);
+err_disable_pm:
+	devm_release_action(core->dev, iris_disable_runtime_pm, core->dev);
+err_deinit_cb:
+	iris_deinit_context_bank_devices(core);
 
 	return ret;
 }
@@ -356,6 +421,7 @@ static const struct dev_pm_ops iris_pm_ops = {
 };
 
 static const struct of_device_id iris_dt_match[] = {
+	{ .compatible = "qcom,kaanapali-iris", .data = &kaanapali_data },
 	{
 		.compatible = "qcom,milos-iris",
 		.data = &milos_data,
@@ -397,6 +463,8 @@ static struct platform_driver qcom_iris_driver = {
 	.remove = iris_remove,
 	.driver = {
 		.name = "qcom-iris",
+		/* Built-in diagnostic: failed PAS shutdown retains DMA/cache ownership. */
+		.suppress_bind_attrs = true,
 		.of_match_table = iris_dt_match,
 		.pm = &iris_pm_ops,
 	},

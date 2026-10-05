@@ -82,6 +82,7 @@ enum {
 enum {
 	DPU_DSPP_PCC = 0x1,
 	DPU_DSPP_GC,
+	DPU_DSPP_SPR,
 	DPU_DSPP_MAX
 };
 
@@ -143,10 +144,12 @@ enum {
 /**
  * DSC sub-blocks/features
  * @DPU_DSC_NATIVE_42x_EN     Supports NATIVE_422_EN and NATIVE_420_EN encoding
+ * @DPU_DSC_FULL_ICH_PREC     Full ICH precision for components wider than 8 bits
  * @DPU_DSC_MAX
  */
 enum {
 	DPU_DSC_NATIVE_42x_EN = 0x1,
+	DPU_DSC_FULL_ICH_PREC,
 	DPU_DSC_MAX
 };
 

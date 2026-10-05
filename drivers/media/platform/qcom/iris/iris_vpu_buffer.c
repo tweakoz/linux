@@ -1814,6 +1814,71 @@ static u32 hfi_vpu4x_buffer_line_vp9d(u32 frame_width, u32 frame_height, u32 _yu
 	return lb_size + dpb_obp_size;
 }
 
+static u32 hfi_vpu4x_buffer_line_h265d(u32 frame_width, u32 frame_height, bool is_opb,
+				       u32 num_vpp_pipes)
+{
+	u32 num_lcu_per_pipe, fe_left_lb, se_left_lb, vsp_left_lb, top_lb, qp_size,
+	    dpb_obp = 0, lcu_size = 16;
+
+	num_lcu_per_pipe = (DIV_ROUND_UP(frame_height, lcu_size) / num_vpp_pipes) +
+			   (DIV_ROUND_UP(frame_height, lcu_size) % num_vpp_pipes);
+
+	fe_left_lb = ALIGN((DMA_ALIGNMENT * num_lcu_per_pipe), DMA_ALIGNMENT) *
+				FE_LFT_CTRL_LINE_NUMBERS;
+	fe_left_lb += ALIGN((DMA_ALIGNMENT * 2 * num_lcu_per_pipe), DMA_ALIGNMENT) *
+				FE_LFT_DB_DATA_LINE_NUMBERS;
+	fe_left_lb += ALIGN((DMA_ALIGNMENT * num_lcu_per_pipe), DMA_ALIGNMENT);
+	fe_left_lb += ALIGN((DMA_ALIGNMENT * 2 * num_lcu_per_pipe), DMA_ALIGNMENT);
+	fe_left_lb += ALIGN((DMA_ALIGNMENT * 8 * num_lcu_per_pipe), DMA_ALIGNMENT) *
+				FE_LFT_LR_DATA_LINE_NUMBERS;
+
+	if (is_opb)
+		dpb_obp = size_dpb_opb(frame_height, lcu_size) * num_vpp_pipes;
+
+	se_left_lb = max_t(u32, (ALIGN(frame_height, BUFFER_ALIGNMENT_16_BYTES) >> 3) *
+				MAX_SE_NBR_CTRL_LCU16_LINE_BUFFER_SIZE,
+				max_t(u32, (ALIGN(frame_height, BUFFER_ALIGNMENT_32_BYTES) >> 3) *
+				MAX_SE_NBR_CTRL_LCU32_LINE_BUFFER_SIZE,
+				(ALIGN(frame_height, BUFFER_ALIGNMENT_64_BYTES) >> 3) *
+				MAX_SE_NBR_CTRL_LCU64_LINE_BUFFER_SIZE));
+
+	vsp_left_lb = ALIGN(DIV_ROUND_UP(frame_height, BUFFER_ALIGNMENT_64_BYTES) *
+				H265_NUM_TILE_ROW, DMA_ALIGNMENT);
+
+	top_lb = ALIGN((DMA_ALIGNMENT * DIV_ROUND_UP(frame_width, lcu_size)), DMA_ALIGNMENT) *
+				FE_TOP_CTRL_LINE_NUMBERS;
+	top_lb += ALIGN(DMA_ALIGNMENT * 2 * DIV_ROUND_UP(frame_width, lcu_size), DMA_ALIGNMENT) *
+				FE_TOP_DATA_LUMA_LINE_NUMBERS;
+	top_lb += ALIGN(DMA_ALIGNMENT * 2 * (DIV_ROUND_UP(frame_width, lcu_size) + 1),
+			DMA_ALIGNMENT) * FE_TOP_DATA_CHROMA_LINE_NUMBERS;
+	top_lb += ALIGN(ALIGN(frame_width, BUFFER_ALIGNMENT_64_BYTES) * 2, DMA_ALIGNMENT);
+	top_lb += ALIGN(ALIGN(frame_width, BUFFER_ALIGNMENT_64_BYTES) * 6, DMA_ALIGNMENT);
+	top_lb += size_h265d_lb_vsp_top(frame_width, frame_height);
+
+	qp_size = size_h265d_qp(frame_width, frame_height);
+
+	return ((ALIGN(dpb_obp, DMA_ALIGNMENT) + ALIGN(se_left_lb, DMA_ALIGNMENT) +
+		ALIGN(vsp_left_lb, DMA_ALIGNMENT)) * num_vpp_pipes) +
+		ALIGN(fe_left_lb, DMA_ALIGNMENT) + ALIGN(top_lb, DMA_ALIGNMENT) +
+		ALIGN(qp_size, DMA_ALIGNMENT);
+}
+
+/* Exact OEM HFI_BUFFER_LINE_H264D_IRIS4 allocation, without downscaling. */
+static u32 hfi_vpu4x_buffer_line_h264d(u32 width, u32 height, u32 num_vpp_pipes)
+{
+ static const u32 left_fe[] = { 880640, 1320960, 2818048, 5636096 };
+ static const u32 dpb_opb[] = { 494592, 740352, 1575936, 3148800 };
+ static const u32 left_se[] = { 1280, 1920, 4096, 8192 };
+ static const u32 top_lb[] = { 207360, 310528, 665080, 1320192 };
+ u32 hr = height <= 1280 ? 0 : height <= 1920 ? 1 : height <= 4096 ? 2 : 3;
+ u32 wr = width <= 1280 ? 0 : width <= 1920 ? 1 : width <= 4096 ? 2 : 3;
+
+ return ALIGN(left_fe[hr], DMA_ALIGNMENT) +
+        (ALIGN(dpb_opb[hr], DMA_ALIGNMENT) + ALIGN(left_se[hr], DMA_ALIGNMENT)) *
+        num_vpp_pipes + ALIGN(top_lb[wr], DMA_ALIGNMENT) +
+        ALIGN(size_h264d_qp(width, height), DMA_ALIGNMENT);
+}
+
 static u32 iris_vpu4x_dec_line_size(struct iris_inst *inst)
 {
 	u32 num_vpp_pipes = inst->core->iris_platform_data->num_vpp_pipe;
@@ -1827,9 +1892,9 @@ static u32 iris_vpu4x_dec_line_size(struct iris_inst *inst)
 		is_opb = true;
 
 	if (inst->codec == V4L2_PIX_FMT_H264)
-		return hfi_buffer_line_h264d(width, height, is_opb, num_vpp_pipes);
+		return hfi_vpu4x_buffer_line_h264d(width, height, num_vpp_pipes);
 	else if (inst->codec == V4L2_PIX_FMT_HEVC)
-		return hfi_buffer_line_h265d(width, height, is_opb, num_vpp_pipes);
+		return hfi_vpu4x_buffer_line_h265d(width, height, is_opb, num_vpp_pipes);
 	else if (inst->codec == V4L2_PIX_FMT_VP9)
 		return hfi_vpu4x_buffer_line_vp9d(width, height, out_min_count, is_opb,
 						  num_vpp_pipes);
@@ -1856,10 +1921,19 @@ static u32 hfi_vpu4x_buffer_persist_vp9d(void)
 		HDR10_HIST_EXTRADATA_SIZE;
 }
 
+/* Iris4 reserves per-picture ARP state; Dolby RPU is not enabled here. */
+static u32 hfi_vpu4x_buffer_persist_h264d(void)
+{
+	return ALIGN(SIZE_SLIST_BUF_H264 * NUM_SLIST_BUF_H264 +
+		     H264_DISPLAY_BUF_SIZE * H264_NUM_FRM_INFO +
+		     NUM_HW_PIC_BUF * (SIZE_SEI_USERDATA + 9728),
+		     DMA_ALIGNMENT);
+}
+
 static u32 iris_vpu4x_dec_persist_size(struct iris_inst *inst)
 {
 	if (inst->codec == V4L2_PIX_FMT_H264)
-		return hfi_buffer_persist_h264d();
+		return hfi_vpu4x_buffer_persist_h264d();
 	else if (inst->codec == V4L2_PIX_FMT_HEVC)
 		return hfi_vpu4x_buffer_persist_h265d(0);
 	else if (inst->codec == V4L2_PIX_FMT_VP9)
@@ -2150,6 +2224,36 @@ u32 iris_vpu33_buf_size(struct iris_inst *inst, enum iris_buffer_type buffer_typ
 	return size;
 }
 
+/* OEM Iris4 reserves two full aligned NV12 UBWC surfaces for this class. */
+static u32 hfi_vpu4x_buffer_dpb_h264d(u32 width, u32 height)
+{
+	u32 stride = ALIGN(width, 128);
+	u32 y = ALIGN(stride * ALIGN(height, 32), 4096);
+	u32 uv = ALIGN(stride * ALIGN(DIV_ROUND_UP(height, 2), 32), 4096);
+	u32 meta_stride = ALIGN(DIV_ROUND_UP(width, 32), 64);
+	u32 y_meta = ALIGN(meta_stride * ALIGN(DIV_ROUND_UP(height, 8), 16), 4096);
+	u32 uv_meta = ALIGN(meta_stride *
+			    ALIGN(DIV_ROUND_UP(DIV_ROUND_UP(height, 2), 8), 16), 4096);
+
+	return 2 * (y + uv + y_meta + uv_meta);
+}
+
+static u32 iris_vpu4x_dec_dpb_size(struct iris_inst *inst)
+{
+	u32 size = iris_vpu_dec_dpb_size(inst);
+	u32 width = inst->fmt_src->fmt.pix_mp.width;
+	u32 height = inst->fmt_src->fmt.pix_mp.height;
+
+	/* Match OEM res_is_less_than_or_equal_to(), including portrait input. */
+	if (size && inst->codec == V4L2_PIX_FMT_H264 &&
+	    !iris_fmt_is_10bit(inst->fmt_dst->fmt.pix_mp.pixelformat) &&
+	    width <= 1920 && height <= 1920 &&
+	    DIV_ROUND_UP(width, 16) * DIV_ROUND_UP(height, 16) <= 120 * 68)
+		return max(size, hfi_vpu4x_buffer_dpb_h264d(width, height));
+
+	return size;
+}
+
 u32 iris_vpu4x_buf_size(struct iris_inst *inst, enum iris_buffer_type buffer_type)
 {
 	const struct iris_vpu_buf_type_handle *buf_type_handle_arr = NULL;
@@ -2161,7 +2265,7 @@ u32 iris_vpu4x_buf_size(struct iris_inst *inst, enum iris_buffer_type buffer_typ
 		{BUF_NON_COMV,    iris_vpu_dec_non_comv_size    },
 		{BUF_LINE,        iris_vpu4x_dec_line_size      },
 		{BUF_PERSIST,     iris_vpu4x_dec_persist_size   },
-		{BUF_DPB,         iris_vpu_dec_dpb_size         },
+		{BUF_DPB,         iris_vpu4x_dec_dpb_size       },
 		{BUF_SCRATCH_1,   iris_vpu_dec_scratch1_size    },
 	};
 

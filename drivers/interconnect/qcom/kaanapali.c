@@ -1624,6 +1624,10 @@ static const struct regmap_config kaanapali_lpass_ag_noc_regmap_config = {
 
 static const struct qcom_icc_desc kaanapali_lpass_ag_noc = {
 	.config = &kaanapali_lpass_ag_noc_regmap_config,
+	/* PSR_AUDIO_PROBE_BEGIN */
+	/* Probe only: do not access unpowered LPASS QoS. */
+	.qos_requires_clocks = true,
+	/* PSR_AUDIO_PROBE_END */
 	.nodes = lpass_ag_noc_nodes,
 	.num_nodes = ARRAY_SIZE(lpass_ag_noc_nodes),
 };
@@ -1647,6 +1651,10 @@ static const struct regmap_config kaanapali_lpass_lpiaon_noc_regmap_config = {
 
 static const struct qcom_icc_desc kaanapali_lpass_lpiaon_noc = {
 	.config = &kaanapali_lpass_lpiaon_noc_regmap_config,
+	/* PSR_AUDIO_PROBE_BEGIN */
+	/* Probe only: do not access unpowered LPASS QoS. */
+	.qos_requires_clocks = true,
+	/* PSR_AUDIO_PROBE_END */
 	.nodes = lpass_lpiaon_noc_nodes,
 	.num_nodes = ARRAY_SIZE(lpass_lpiaon_noc_nodes),
 	.bcms = lpass_lpiaon_noc_bcms,
@@ -1668,6 +1676,10 @@ static const struct regmap_config kaanapali_lpass_lpicx_noc_regmap_config = {
 
 static const struct qcom_icc_desc kaanapali_lpass_lpicx_noc = {
 	.config = &kaanapali_lpass_lpicx_noc_regmap_config,
+	/* PSR_AUDIO_PROBE_BEGIN */
+	/* Probe only: do not access unpowered LPASS QoS. */
+	.qos_requires_clocks = true,
+	/* PSR_AUDIO_PROBE_END */
 	.nodes = lpass_lpicx_noc_nodes,
 	.num_nodes = ARRAY_SIZE(lpass_lpicx_noc_nodes),
 };

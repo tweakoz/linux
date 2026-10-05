@@ -2957,3 +2957,14 @@ config SND_SOC_LPASS_TX_MACRO
 	tristate "Qualcomm TX Macro in LPASS(Low Power Audio SubSystem)"
 
 endmenu
+
+# BEGIN POD PSR TFA986X FIRST TONE
+config SND_SOC_PSR_TFA986X_FIRST_TONE
+	bool "PSR TFA986x bounded first-tone diagnostic"
+	depends on I2C && SND_SOC && REGULATOR
+	select REGMAP_I2C
+	default n
+	help
+	  Exact PSR stock-derived volatile setup; one PCM start per bind with a
+	  one-second software cutoff. Not a sustained speaker-protection driver.
+# END POD PSR TFA986X FIRST TONE

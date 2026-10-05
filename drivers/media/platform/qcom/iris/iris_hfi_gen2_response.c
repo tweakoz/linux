@@ -3,6 +3,12 @@
  * Copyright (c) 2022-2024 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
+#include <linux/dma-mapping.h>
+#include <linux/io.h>
+#include <linux/of.h>
+#include <linux/of_platform.h>
+#include <linux/pm_runtime.h>
+#include <linux/regmap.h>
 #include <media/v4l2-mem2mem.h>
 
 #include "iris_hfi_gen2.h"
@@ -272,6 +278,142 @@ static int iris_hfi_gen2_handle_session_error(struct iris_inst *inst,
 	return 0;
 }
 
+/* Called with core->lock held, before recovery can release SFR memory. */
+static void iris_hfi_gen2_log_sfr(struct iris_core *core)
+{
+	const char *reason;
+	size_t length, offset, count;
+	u32 size;
+	char chunk[257];
+
+	if (!core->sfr_vaddr)
+		return;
+
+	/* Coherent firmware DMA precedes its failure notification. */
+	dma_rmb();
+	size = READ_ONCE(*(u32 *)core->sfr_vaddr);
+	if (size != SFR_SIZE) {
+		dev_err(core->dev, "SFR invalid size %u (allocation %u)\n", size, SFR_SIZE);
+		return;
+	}
+
+	reason = (const char *)core->sfr_vaddr + sizeof(u32);
+	length = strnlen(reason, SFR_SIZE - sizeof(u32));
+	dev_err(core->dev, "SFR reason bytes=%zu terminated=%u\n", length,
+		(unsigned int)(length < SFR_SIZE - sizeof(u32)));
+	/* Bounded chunks avoid printk truncation; never alter firmware memory. */
+	for (offset = 0; offset < length; offset += count) {
+		count = min_t(size_t, sizeof(chunk) - 1, length - offset);
+		memcpy(chunk, reason + offset, count);
+		chunk[count] = '\0';
+		dev_err(core->dev, "SFR[%zu]: %s\n", offset, chunk);
+	}
+}
+
+/* OEM Iris4 NoC fatal diagnostic: read only, while existing core lock is held. */
+static void iris_psr_log_noc(struct iris_core *core)
+{
+	static const u32 offsets[] = {
+		0x1a020, 0x1a024, 0x1a028, 0x1a02c,
+		0x1a030, 0x1a034, 0x1a038, 0x1a03c,
+	};
+	u32 power, value;
+	unsigned int i;
+
+	if (!of_device_is_compatible(core->dev->of_node, "qcom,kaanapali-iris"))
+		return;
+	/* OEM WRAPPER_CORE_POWER_STATUS: bit1 means hardware powered on. */
+	power = readl(core->reg_base + 0xb0080);
+	dev_err(core->dev, "PSR fatal CORE_POWER_STATUS=%#x\n", power);
+	if (!(power & BIT(1))) {
+		dev_err(core->dev, "PSR fatal NoC skipped: hardware power collapsed\n");
+		return;
+	}
+	/* Native iris_vpu4x: EFUSE APV-disable bit27; CLOCK_CONFIG APV-halt bit1. */
+	value = readl(core->reg_base + 0xb0008);
+	dev_err(core->dev, "PSR fatal WRAPPER_EFUSE_MONITOR=%#x\n", value);
+	value = readl(core->reg_base + 0xb0088);
+	dev_err(core->dev, "PSR fatal WRAPPER_CORE_CLOCK_CONFIG=%#x\n", value);
+	/* Exact OEM ERRLOG0..3 low/high reads; never ERRCLR or MAINCTL. */
+	for (i = 0; i < ARRAY_SIZE(offsets); i++) {
+		value = readl(core->reg_base + offsets[i]);
+		dev_err(core->dev, "PSR fatal NOC offset=%#x value=%#x\n",
+			offsets[i], value);
+	}
+}
+
+/* Diagnostic only: never resume, enable or write VIDEOCC to obtain evidence. */
+static void iris_psr_log_videocc(struct iris_core *core)
+{
+	static const u32 offsets[] = {
+		0x80e4, /* memory enable/ACK */
+		0x80e0, 0x80d0, 0x80bc, 0x8134, 0x8108, 0x8090, 0x8174, 0x8164,
+		0x80a8, 0x8120, 0x80f4, 0x807c, 0x814c, /* GDSCs */
+		0x80ac, 0x8124, 0x80f8, 0x8080, 0x8150, /* CFG_GDSCR completion */
+		0x8030, 0x8034, 0x8000, 0x8004, 0x8018, 0x801c, 0x8048, 0x804c,
+		0x817c, 0x81bc, 0x81b0, 0x81ac, /* critical branches */
+	};
+	u32 values[ARRAY_SIZE(offsets)] = { 0 };
+	int errors[ARRAY_SIZE(offsets)];
+	struct device_node *node;
+	struct platform_device *pdev;
+	struct regmap *map;
+	unsigned int i;
+	int active;
+
+	if (!of_device_is_compatible(core->dev->of_node, "qcom,kaanapali-iris"))
+		return;
+	node = of_find_compatible_node(NULL, NULL, "qcom,kaanapali-videocc");
+	if (!node) {
+		dev_err(core->dev, "PSR fatal VIDEOCC skipped: no owner node\n");
+		return;
+	}
+	pdev = of_find_device_by_node(node);
+	of_node_put(node);
+	if (!pdev) {
+		dev_err(core->dev, "PSR fatal VIDEOCC skipped: no owner device\n");
+		return;
+	}
+	/* Avoid waiting on driver bind/unbind while holding the Iris core lock. */
+	if (!device_trylock(&pdev->dev)) {
+		dev_err(core->dev, "PSR fatal VIDEOCC skipped: owner lock busy\n");
+		goto put_device;
+	}
+	if (!pdev->dev.driver) {
+		dev_err(core->dev, "PSR fatal VIDEOCC skipped: owner unbound\n");
+		goto unlock;
+	}
+	active = pm_runtime_get_if_in_use(&pdev->dev);
+	if (active <= 0) {
+		dev_err(core->dev, "PSR fatal VIDEOCC skipped: existing runtime user unavailable (%d)\n",
+			active);
+		goto unlock;
+	}
+	map = dev_get_regmap(&pdev->dev, NULL);
+	if (!map) {
+		dev_err(core->dev, "PSR fatal VIDEOCC skipped: owner regmap unavailable\n");
+		goto put_runtime;
+	}
+	/* Collect first, then print: console throughput must not space MMIO reads. */
+	for (i = 0; i < ARRAY_SIZE(offsets); i++)
+		errors[i] = regmap_read(map, offsets[i], &values[i]);
+	for (i = 0; i < ARRAY_SIZE(offsets); i++) {
+		if (errors[i])
+			dev_err(core->dev, "PSR fatal VIDEOCC offset=%#x read_error=%d\n",
+				offsets[i], errors[i]);
+		else
+			dev_err(core->dev, "PSR fatal VIDEOCC offset=%#x value=%#x\n",
+				offsets[i], values[i]);
+	}
+put_runtime:
+	/* Drop only our temporary reference, without starting an idle transition. */
+	pm_runtime_put_noidle(&pdev->dev);
+unlock:
+	device_unlock(&pdev->dev);
+put_device:
+	put_device(&pdev->dev);
+}
+
 static int iris_hfi_gen2_handle_system_error(struct iris_core *core,
 					     struct iris_hfi_packet *pkt)
 {
@@ -283,6 +425,9 @@ static int iris_hfi_gen2_handle_system_error(struct iris_core *core,
 	core->state = IRIS_CORE_ERROR;
 
 	mutex_lock(&core->lock);
+	iris_psr_log_videocc(core);
+	iris_psr_log_noc(core);
+	iris_hfi_gen2_log_sfr(core);
 	list_for_each_entry(instance, &core->instances, list)
 		iris_inst_change_state(instance, IRIS_INST_ERROR);
 	mutex_unlock(&core->lock);
@@ -1004,7 +1149,10 @@ static void iris_hfi_gen2_flush_debug_queue(struct iris_core *core, u8 *packet)
 
 		packet[pkt->size] = '\0';
 		log = (u8 *)packet + sizeof(*pkt) + 1;
-		dev_dbg(core->dev, "%s", log);
+		if (pkt->debug_level & HFI_DEBUG_LOG_ERROR_FATAL)
+			dev_warn(core->dev, "firmware: %s", log);
+		else
+			dev_dbg(core->dev, "%s", log);
 	}
 }
 

@@ -4,11 +4,18 @@
  */
 
 #include <linux/bitfield.h>
+#include <linux/of.h>
+#include <linux/iommu.h>
+#include <linux/overflow.h>
 
 #include "iris_hfi_gen2.h"
 #include "iris_hfi_gen2_packet.h"
+#include "iris_resources.h"
 
 #define UNSPECIFIED_COLOR_FORMAT 5
+
+/* One session per kernel lifetime; never reset by firmware recovery. */
+static atomic_t psr_descriptor_session = ATOMIC_INIT(0);
 #define NUM_SYS_INIT_PACKETS 8
 
 #define SYS_INIT_PKT_SIZE (sizeof(struct iris_hfi_header) + \
@@ -42,12 +49,19 @@ static int iris_hfi_gen2_sys_image_version(struct iris_core *core)
 	struct iris_hfi_header *hdr;
 	int ret;
 
-	hdr = kzalloc(SYS_NO_PAYLOAD_PKT_SIZE, GFP_KERNEL);
+	hdr = kzalloc(sizeof(*hdr) + 2 * (sizeof(struct iris_hfi_packet) + sizeof(u32)),
+		      GFP_KERNEL);
 	if (!hdr)
 		return -ENOMEM;
 
 	iris_hfi_gen2_packet_image_version(core, hdr);
 	ret = iris_hfi_queue_cmd_write_locked(core, hdr, hdr->size);
+
+	if (!ret) {
+		iris_hfi_gen2_packet_psr_debug(core, hdr);
+		ret = iris_hfi_queue_cmd_write_locked(core, hdr, hdr->size);
+		dev_info(core->dev, "PSR firmware error/fatal log request: result=%d\n", ret);
+	}
 
 	kfree(hdr);
 
@@ -804,6 +818,11 @@ static int iris_hfi_gen2_session_open(struct iris_inst *inst)
 	if (inst->state != IRIS_INST_DEINIT)
 		return -EALREADY;
 
+	inst_hfi_gen2->psr_diag_selected =
+		of_device_is_compatible(inst->core->dev->of_node, "qcom,kaanapali-iris") &&
+		atomic_cmpxchg(&psr_descriptor_session, 0, 1) == 0;
+	atomic_set(&inst_hfi_gen2->psr_diag_remaining, 64);
+	atomic_set(&inst_hfi_gen2->psr_diag_external, 0);
 	inst_hfi_gen2->ipsc_properties_set = false;
 	inst_hfi_gen2->opsc_properties_set = false;
 
@@ -1287,24 +1306,101 @@ static int iris_hfi_gen2_set_num_comv(struct iris_inst *inst)
 						  &num_comv, sizeof(u32));
 }
 
-static void iris_hfi_gen2_get_buffer(u32 domain, struct iris_buffer *buffer,
+static void iris_hfi_gen2_get_buffer(struct iris_inst *inst, struct iris_buffer *buffer,
 				     struct iris_hfi_buffer *buf)
 {
 	memset(buf, 0, sizeof(*buf));
-	buf->type = iris_hfi_gen2_buf_type_from_driver(domain, buffer->type);
+	buf->type = iris_hfi_gen2_buf_type_from_driver(inst->domain, buffer->type);
 	buf->index = buffer->index;
 	buf->base_address = buffer->device_addr;
 	buf->addr_offset = 0;
 	buf->buffer_size = buffer->buffer_size;
 
-	if (domain == DECODER && buffer->type == BUF_INPUT)
+	if (inst->domain == DECODER && buffer->type == BUF_INPUT)
 		buf->buffer_size = ALIGN(buffer->buffer_size, 256);
 	buf->data_offset = buffer->data_offset;
 	buf->data_size = buffer->data_size;
 	if (buffer->attr & BUF_ATTR_PENDING_RELEASE)
 		buf->flags |= HFI_BUF_HOST_FLAG_RELEASE;
-	buf->flags |= HFI_BUF_HOST_FLAGS_CB_NON_SECURE;
+	/* Canoe firmware distinguishes pixel IOVAs from the other nonsecure CB.
+	 * Use the same region selector as DMA allocation. Keep legacy SoCs intact.
+	 */
+	if (of_device_is_compatible(inst->core->dev->of_node, "qcom,kaanapali-iris") &&
+	    iris_get_region(inst, buffer->type) == IRIS_PIXEL_REGION)
+		buf->flags |= HFI_BUF_HOST_FLAGS_CB_NON_SECURE_PIXEL;
+	else
+		buf->flags |= HFI_BUF_HOST_FLAGS_CB_NON_SECURE;
 	buf->timestamp = buffer->timestamp;
+}
+
+/* Read-only first-session evidence; does not change any HFI bytes or mapping. */
+static void iris_psr_log_descriptor(struct iris_inst *inst, struct iris_buffer *buffer,
+				    const struct iris_hfi_buffer *hfi, u32 port)
+{
+	struct iris_inst_hfi_gen2 *g = to_iris_inst_hfi_gen2(inst);
+	enum iris_buffer_region region = iris_get_region(inst, buffer->type);
+	struct device *selected = iris_get_cb_dev(inst->core, region);
+	struct device *owner = selected;
+	struct iommu_domain *domain;
+	struct iommu_fwspec *spec;
+	u64 capacity = buffer->buffer_size, end = 0, payload_end = 0;
+	u64 policy_start = region == IRIS_PIXEL_REGION ? 0x100000 : 0x25800000;
+	bool external = buffer->type == BUF_INPUT || buffer->type == BUF_OUTPUT;
+	bool overflow, capacity_ok, payload_ok, policy_ok;
+	unsigned int i;
+	int remaining;
+
+	if (!g->psr_diag_selected)
+		return;
+	if (external) {
+		int bit = buffer->type == BUF_INPUT ? 1 : 2;
+
+		if (atomic_fetch_or(bit, &g->psr_diag_external) & bit)
+			return;
+	}
+	remaining = atomic_dec_if_positive(&g->psr_diag_remaining);
+	if (remaining < 0)
+		return;
+	if (external) {
+		owner = NULL;
+		capacity = 0;
+		if (buffer->vb2.vb2_buf.vb2_queue) {
+			owner = buffer->vb2.vb2_buf.vb2_queue->dev;
+			capacity = vb2_plane_size(&buffer->vb2.vb2_buf, 0);
+		}
+	}
+	overflow = check_add_overflow(hfi->base_address, (u64)hfi->addr_offset, &end) ||
+		check_add_overflow(end, (u64)hfi->buffer_size, &end);
+	capacity_ok = hfi->addr_offset <= capacity &&
+		hfi->buffer_size <= capacity - hfi->addr_offset;
+	payload_ok = !check_add_overflow((u64)hfi->data_offset, (u64)hfi->data_size,
+					&payload_end) && payload_end <= hfi->buffer_size;
+	/* Exact existing PSR context apertures; diagnostic assertion, not a mapping. */
+	policy_ok = !overflow && hfi->buffer_size &&
+		hfi->base_address >= policy_start && end <= 0xffc00000ULL;
+	dev_info(inst->core->dev,
+		 "PSR descriptor domain=%u type=%u index=%u region=%u owner=%s selected=%s owner_match=%u capacity_kind=%s capacity=%llu allocation_request=%zu iova=%#llx end=%#llx overflow=%u capacity_ok=%u payload_ok=%u policy_ok=%u hfi_type=%u flags=%#x port=%u addr_offset=%u size=%u data_offset=%u data_size=%u remaining=%d\n",
+		 inst->domain, buffer->type, buffer->index, region,
+		 owner ? dev_name(owner) : "missing", selected ? dev_name(selected) : "missing",
+		 owner == selected, external ? "vb2-plane" : "internal-request",
+		 capacity, buffer->buffer_size, hfi->base_address, end, overflow,
+		 capacity_ok, payload_ok, policy_ok, hfi->type, hfi->flags, port,
+		 hfi->addr_offset, hfi->buffer_size, hfi->data_offset, hfi->data_size, remaining);
+	if (!owner)
+		return;
+	domain = iommu_get_domain_for_dev(owner);
+	spec = dev_iommu_fwspec_get(owner);
+	dev_info(inst->core->dev,
+		 "PSR descriptor context owner=%s dma_mask=%#llx mapped=%u ids=%u geometry_present=%u aperture_start=%#llx aperture_end=%#llx forced=%u\n",
+		 dev_name(owner), owner->dma_mask ? *owner->dma_mask : 0,
+		 device_iommu_mapped(owner), spec ? spec->num_ids : 0, !!domain,
+		 domain ? domain->geometry.aperture_start : 0,
+		 domain ? domain->geometry.aperture_end : 0,
+		 domain ? domain->geometry.force_aperture : 0);
+	if (spec)
+		for (i = 0; i < min_t(unsigned int, spec->num_ids, 4); i++)
+			dev_info(inst->core->dev, "PSR descriptor sid[%u]=%#x owner=%s\n",
+				 i, spec->ids[i], dev_name(owner));
 }
 
 static int iris_hfi_gen2_session_queue_buffer(struct iris_inst *inst, struct iris_buffer *buffer)
@@ -1314,7 +1410,7 @@ static int iris_hfi_gen2_session_queue_buffer(struct iris_inst *inst, struct iri
 	u32 port;
 	int ret;
 
-	iris_hfi_gen2_get_buffer(inst->domain, buffer, &hfi_buffer);
+	iris_hfi_gen2_get_buffer(inst, buffer, &hfi_buffer);
 	if (buffer->type == BUF_COMV) {
 		ret = iris_hfi_gen2_set_num_comv(inst);
 		if (ret)
@@ -1322,6 +1418,7 @@ static int iris_hfi_gen2_session_queue_buffer(struct iris_inst *inst, struct iri
 	}
 
 	port = iris_hfi_gen2_get_port_from_buf_type(inst, buffer->type);
+	iris_psr_log_descriptor(inst, buffer, &hfi_buffer, port);
 	iris_hfi_gen2_packet_session_command(inst,
 					     HFI_CMD_BUFFER,
 					     HFI_HOST_FLAGS_INTR_REQUIRED,
@@ -1341,7 +1438,7 @@ static int iris_hfi_gen2_session_release_buffer(struct iris_inst *inst, struct i
 	struct iris_hfi_buffer hfi_buffer;
 	u32 port;
 
-	iris_hfi_gen2_get_buffer(inst->domain, buffer, &hfi_buffer);
+	iris_hfi_gen2_get_buffer(inst, buffer, &hfi_buffer);
 	hfi_buffer.flags |= HFI_BUF_HOST_FLAG_RELEASE;
 	port = iris_hfi_gen2_get_port_from_buf_type(inst, buffer->type);
 

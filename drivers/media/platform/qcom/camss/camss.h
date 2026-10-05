@@ -93,10 +93,10 @@ enum camss_version {
 	CAMSS_8280XP,
 	CAMSS_8300,
 	CAMSS_845,
-	CAMSS_8450,
 	CAMSS_8550,
 	CAMSS_8650,
 	CAMSS_8775P,
+	CAMSS_KAANAPALI,
 	CAMSS_X1E80100,
 };
 
@@ -139,7 +139,14 @@ struct camss {
 	struct device_link *genpd_link;
 	struct icc_path *icc_path[ICC_SM8250_COUNT];
 	const struct camss_resources *res;
+	bool legacy_phy;
 };
+
+/* PSR IMX906 full-width RAW capture. This is not a general HW maximum. */
+static inline unsigned int camss_frame_max_width(const struct camss *camss)
+{
+	return camss->res->version == CAMSS_KAANAPALI ? 8192 : 8191;
+}
 
 struct camss_camera_interface {
 	u8 csiphy_id;

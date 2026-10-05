@@ -123,6 +123,10 @@ static void dpu_hw_dsc_config_1_2(struct dpu_hw_dsc *hw_dsc,
 		data |= BIT(9);
 
 	data |= (_dsc_calc_output_buf_max_addr(hw_dsc, num_active_slice_per_enc) << 18);
+	/* Match the vendor full-precision path for 10-bit panels. */
+	if ((hw_dsc->caps->features & BIT(DPU_DSC_FULL_ICH_PREC)) &&
+	    dsc->bits_per_component > 8)
+		data |= BIT(12);
 
 	DPU_REG_WRITE(hw, sblk->enc.base + ENC_DF_CTRL, data);
 

@@ -113,7 +113,8 @@ static const struct snd_pcm_hardware q6apm_dai_hardware_playback = {
 				 SNDRV_PCM_INFO_PAUSE | SNDRV_PCM_INFO_RESUME |
 				 SNDRV_PCM_INFO_NO_REWINDS | SNDRV_PCM_INFO_SYNC_APPLPTR |
 				 SNDRV_PCM_INFO_BATCH),
-	.formats =              (SNDRV_PCM_FMTBIT_S16_LE | SNDRV_PCM_FMTBIT_S24_LE),
+	.formats =              (SNDRV_PCM_FMTBIT_S16_LE | SNDRV_PCM_FMTBIT_S24_LE |
+				 SNDRV_PCM_FMTBIT_S32_LE),
 	.rates =                SNDRV_PCM_RATE_8000_192000,
 	.rate_min =             8000,
 	.rate_max =             192000,
@@ -234,6 +235,8 @@ static int q6apm_dai_prepare(struct snd_soc_component *component,
 	cfg.sample_rate = runtime->rate;
 	cfg.num_channels = runtime->channels;
 	cfg.bit_width = prtd->bits_per_sample;
+	/* ALSA S24_LE has 24 valid bits in a 32-bit host word. */
+	cfg.bits_per_sample = snd_pcm_format_physical_width(runtime->format);
 	cfg.fmt = SND_AUDIOCODEC_PCM;
 	audioreach_set_default_channel_mapping(cfg.channel_map, runtime->channels);
 	if (prtd->state) {
@@ -521,6 +524,11 @@ static int q6apm_dai_hw_params(struct snd_soc_component *component,
 		break;
 	case SNDRV_PCM_FORMAT_S24_LE:
 		prtd->bits_per_sample = 24;
+		break;
+	case SNDRV_PCM_FORMAT_S32_LE:
+		if (substream->stream != SNDRV_PCM_STREAM_PLAYBACK)
+			return -EINVAL;
+		prtd->bits_per_sample = 32;
 		break;
 	default:
 		return -EINVAL;

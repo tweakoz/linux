@@ -394,7 +394,9 @@ static int dpu_hw_intf_enable_te(struct dpu_hw_intf *intf,
 	DPU_REG_WRITE(c, INTF_TEAR_SYNC_WRCOUNT,
 			(te->start_pos + te->sync_threshold_start + 1));
 
-	DPU_REG_WRITE(c, INTF_TEAR_TEAR_CHECK_EN, 1);
+	/* Canoe advertises SDE_INTF_TE_SINGLE_UPDATE in the stock catalog. */
+	DPU_REG_WRITE(c, INTF_TEAR_TEAR_CHECK_EN,
+		      intf->mdss_ver->core_major_ver == 13 ? BIT(0) | BIT(3) : BIT(0));
 
 	return 0;
 }

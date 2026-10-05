@@ -9,6 +9,7 @@
 #include <linux/clk.h>
 #include <linux/completion.h>
 #include <linux/delay.h>
+#include <linux/of.h>
 #include <linux/iopoll.h>
 #include <linux/phy/phy.h>
 #include <linux/phy/phy-dp.h>
@@ -24,6 +25,20 @@
 #include "dp_reg.h"
 #include "dp_ctrl.h"
 #include "dp_link.h"
+
+static bool bean_android_tps4 = true;
+module_param_named(bean_android_tps4, bean_android_tps4, bool, 0600);
+MODULE_PARM_DESC(bean_android_tps4,
+	"Android bean_tps4: TPS4 for EQ on the exact Bean receiver at HBR3x2");
+
+static bool bean_drive_pair21 = true;
+module_param_named(bean_drive_pair21, bean_drive_pair21, bool, 0600);
+MODULE_PARM_DESC(bean_drive_pair21,
+	"Android bean_drive_consistency prefer_pair21 on the exact Bean receiver at HBR3x2");
+
+struct msm_dp_ctrl_private;
+static bool msm_dp_ctrl_bean_hbr3x2(enum drm_dp_phy dp_phy,
+				    const struct msm_dp_ctrl_private *pCtrl);
 
 #define POLLING_SLEEP_US			1000
 #define POLLING_TIMEOUT_US			10000
@@ -140,6 +155,7 @@ struct msm_dp_ctrl_private {
 	bool core_clks_on;
 	bool link_clks_on;
 	bool stream_clks_on;
+	bool bean_link_fresh;
 };
 
 static inline u32 msm_dp_read_ahb(const struct msm_dp_ctrl_private *ctrl, u32 offset)
@@ -378,6 +394,9 @@ void msm_dp_ctrl_push_idle(struct msm_dp_ctrl *msm_dp_ctrl)
 
 	ctrl = container_of(msm_dp_ctrl, struct msm_dp_ctrl_private, msm_dp_ctrl);
 
+	if (!ctrl->link_clks_on)                  /* link regs hang the bus without link clk */
+		return;
+
 	reinit_completion(&ctrl->idle_comp);
 	msm_dp_write_link(ctrl, REG_DP_STATE_CTRL, DP_STATE_CTRL_PUSH_IDLE);
 
@@ -400,7 +419,8 @@ static void msm_dp_ctrl_config_ctrl(struct msm_dp_ctrl_private *ctrl)
 		config |= DP_CONFIGURATION_CTRL_RGB_YUV; /* YUV420 */
 
 	/* Scrambler reset enable */
-	if (drm_dp_alternate_scrambler_reset_cap(dpcd))
+	if (drm_dp_alternate_scrambler_reset_cap(dpcd) &&
+	    !msm_dp_ctrl_bean_hbr3x2(DP_PHY_DPRX, ctrl))
 		config |= DP_CONFIGURATION_CTRL_ASSR;
 
 	tbd = msm_dp_link_get_test_bits_depth(ctrl->link,
@@ -1315,6 +1335,34 @@ static int msm_dp_ctrl_set_vx_px(struct msm_dp_ctrl_private *ctrl,
 	return 0;
 }
 
+static bool msm_dp_ctrl_bean_hbr3x2(enum drm_dp_phy dp_phy,
+				    const struct msm_dp_ctrl_private *pCtrl)
+{
+	const u8 *dpcd = pCtrl->panel->dpcd;
+
+	return of_machine_is_compatible("oneplus,infiniti") && dp_phy == DP_PHY_DPRX &&
+		dpcd[DP_DPCD_REV] == 0x12 && dpcd[DP_MAX_LINK_RATE] == DP_LINK_BW_8_1 &&
+		dpcd[DP_MAX_LANE_COUNT] == 0xc2 && dpcd[DP_MAX_DOWNSPREAD] == 0x81 &&
+		pCtrl->link->link_params.num_lanes == 2 &&
+		pCtrl->link->link_params.rate == 810000;
+}
+
+static void msm_dp_ctrl_adjust_levels(u8 *link_status, enum drm_dp_phy dp_phy,
+				      struct msm_dp_ctrl_private *pCtrl)
+{
+	struct msm_dp_link *link = pCtrl->link;
+
+	msm_dp_link_adjust_levels(link, link_status);
+	if (!READ_ONCE(bean_drive_pair21) || !msm_dp_ctrl_bean_hbr3x2(dp_phy, pCtrl) ||
+	    link->phy_params.v_level != DP_TRAIN_LEVEL_MAX)
+		return;
+
+	dev_info_ratelimited(pCtrl->dev, "Bean drive pair %u/%u -> 2/1\n",
+			     link->phy_params.v_level, link->phy_params.p_level);
+	link->phy_params.v_level = 2;
+	link->phy_params.p_level = 1;
+}
+
 static int msm_dp_ctrl_update_phy_vx_px(struct msm_dp_ctrl_private *ctrl,
 					enum drm_dp_phy dp_phy)
 {
@@ -1348,6 +1396,10 @@ static int msm_dp_ctrl_update_phy_vx_px(struct msm_dp_ctrl_private *ctrl,
 				pre_emphasis_level);
 		max_level_reached  |= DP_TRAIN_MAX_PRE_EMPHASIS_REACHED;
 	}
+
+	if (READ_ONCE(bean_drive_pair21) && msm_dp_ctrl_bean_hbr3x2(dp_phy, ctrl) &&
+	    voltage_swing_level + pre_emphasis_level == DP_TRAIN_LEVEL_MAX)
+		max_level_reached |= DP_TRAIN_MAX_PRE_EMPHASIS_REACHED;
 
 	pre_emphasis_level <<= DP_TRAIN_PRE_EMPHASIS_SHIFT;
 
@@ -1469,7 +1521,7 @@ static int msm_dp_ctrl_link_train_1(struct msm_dp_ctrl_private *ctrl,
 			old_v_level = ctrl->link->phy_params.v_level;
 		}
 
-		msm_dp_link_adjust_levels(ctrl->link, link_status);
+		msm_dp_ctrl_adjust_levels(link_status, dp_phy, ctrl);
 		ret = msm_dp_ctrl_update_phy_vx_px(ctrl, dp_phy);
 		if (ret)
 			return ret;
@@ -1557,7 +1609,10 @@ static int msm_dp_ctrl_link_train_2(struct msm_dp_ctrl_private *ctrl,
 
 	*training_step = DP_TRAINING_2;
 
-	if (drm_dp_tps4_supported(ctrl->panel->dpcd)) {
+	if (drm_dp_tps4_supported(ctrl->panel->dpcd) ||
+	    (READ_ONCE(bean_android_tps4) && msm_dp_ctrl_bean_hbr3x2(dp_phy, ctrl))) {
+		if (!drm_dp_tps4_supported(ctrl->panel->dpcd))
+			dev_info(ctrl->dev, "Bean HBR3x2: TPS4 for EQ, as Android bean_tps4\n");
 		pattern = DP_TRAINING_PATTERN_4;
 		state_ctrl_bit = 4;
 	} else if (drm_dp_tps3_supported(ctrl->panel->dpcd)) {
@@ -1586,7 +1641,7 @@ static int msm_dp_ctrl_link_train_2(struct msm_dp_ctrl_private *ctrl,
 			return 0;
 		}
 
-		msm_dp_link_adjust_levels(ctrl->link, link_status);
+		msm_dp_ctrl_adjust_levels(link_status, dp_phy, ctrl);
 		ret = msm_dp_ctrl_update_phy_vx_px(ctrl, dp_phy);
 		if (ret)
 			return ret;
@@ -1636,13 +1691,14 @@ static int msm_dp_ctrl_link_train(struct msm_dp_ctrl_private *ctrl,
 
 	msm_dp_aux_link_configure(ctrl->aux, &link_info);
 
-	if (drm_dp_max_downspread(dpcd))
+	if (drm_dp_max_downspread(dpcd) && !msm_dp_ctrl_bean_hbr3x2(DP_PHY_DPRX, ctrl))
 		encoding[0] |= DP_SPREAD_AMP_0_5;
 
 	/* config DOWNSPREAD_CTRL and MAIN_LINK_CHANNEL_CODING_SET */
 	drm_dp_dpcd_write(ctrl->aux, DP_DOWNSPREAD_CTRL, encoding, 2);
 
-	if (drm_dp_alternate_scrambler_reset_cap(dpcd)) {
+	if (drm_dp_alternate_scrambler_reset_cap(dpcd) &&
+	    !msm_dp_ctrl_bean_hbr3x2(DP_PHY_DPRX, ctrl)) {
 		assr = DP_ALTERNATE_SCRAMBLER_RESET_ENABLE;
 		drm_dp_dpcd_write(ctrl->aux, DP_EDP_CONFIGURATION_SET,
 				&assr, 1);
@@ -1805,8 +1861,11 @@ static int msm_dp_ctrl_enable_mainlink_clocks(struct msm_dp_ctrl_private *ctrl)
 
 	dev_pm_opp_set_rate(ctrl->dev, ctrl->link->link_params.rate * 1000);
 	ret = msm_dp_ctrl_link_clk_enable(&ctrl->msm_dp_ctrl);
-	if (ret)
+	if (ret) {
 		DRM_ERROR("Unable to start link clocks. ret=%d\n", ret);
+		dev_pm_opp_set_rate(ctrl->dev, 0);
+		phy_power_off(phy);
+	}
 
 	drm_dbg_dp(ctrl->drm_dev, "link rate=%d\n", ctrl->link->link_params.rate);
 
@@ -2376,6 +2435,7 @@ int msm_dp_ctrl_on_link(struct msm_dp_ctrl *msm_dp_ctrl)
 		 * stop link training at on_stream
 		 * to pass compliance test
 		 */
+		ctrl->bean_link_fresh = msm_dp_ctrl_bean_hbr3x2(DP_PHY_DPRX, ctrl);
 	} else  {
 		/*
 		 * link training failed
@@ -2384,6 +2444,7 @@ int msm_dp_ctrl_on_link(struct msm_dp_ctrl *msm_dp_ctrl)
 		msm_dp_ctrl_clear_training_pattern(ctrl, DP_PHY_DPRX);
 
 		msm_dp_ctrl_deinitialize_mainlink(ctrl);
+		ctrl->bean_link_fresh = false;
 		rc = -ECONNRESET;
 	}
 
@@ -2469,6 +2530,7 @@ int msm_dp_ctrl_on_stream(struct msm_dp_ctrl *msm_dp_ctrl, bool force_link_train
 {
 	int ret = 0;
 	bool mainlink_ready = false;
+	bool bean_fresh;
 	struct msm_dp_ctrl_private *ctrl;
 	unsigned long pixel_rate;
 	unsigned long pixel_rate_orig;
@@ -2516,7 +2578,11 @@ int msm_dp_ctrl_on_stream(struct msm_dp_ctrl *msm_dp_ctrl, bool force_link_train
 		ctrl->stream_clks_on = true;
 	}
 
-	if (force_link_train || !msm_dp_ctrl_channel_eq_ok(ctrl))
+	bean_fresh = ctrl->bean_link_fresh;
+	ctrl->bean_link_fresh = false;
+	if (bean_fresh)
+		dev_info(ctrl->dev, "Bean HBR3x2: keeping the link trained at enable, as Android\n");
+	else if (force_link_train || !msm_dp_ctrl_channel_eq_ok(ctrl))
 		msm_dp_ctrl_link_retrain(ctrl);
 
 	/* stop txing train pattern to end link training */
