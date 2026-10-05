@@ -3,6 +3,9 @@
  * Mode/power data come from the same-phone capture; see tele/FIXED-MODE.json.
  * Captured bounded exposure/gain controls; no guessed VT pixel rate, blanking or frame interval.
  */
+#include <linux/atomic.h>
+#include <linux/kernel.h>
+#include <linux/of.h>
 #include <linux/clk.h>
 #include <linux/delay.h>
 #include <linux/gpio/consumer.h>
@@ -19,6 +22,64 @@
 #include <media/v4l2-fwnode.h>
 #include <media/v4l2-subdev.h>
 #include "psr-s5kjn5-tables.h"
+
+/* Diagnostic gate: never arm via an early kernel command line. One write and
+ * one probe attempt per boot; a failed attempt cannot silently retry hardware.
+ * Driver-core default pinctrl precedes probe and must remain the inert state.
+ */
+#define PSR_TELE_GET(dev, label, operation) ({ \
+	typeof(operation) __resource; \
+	dev_info(dev, "PSR tele resource %s begin\n", label); \
+	__resource = (operation); \
+	dev_info(dev, "PSR tele resource %s end ret=%ld\n", label, \
+		 IS_ERR(__resource) ? PTR_ERR(__resource) : 0L); \
+	__resource; \
+})
+
+#define PSR_TELE_STEP(dev, label, operation) ({ \
+	int __step_ret; \
+	dev_info(dev, "PSR tele stage %s begin\n", label); \
+	__step_ret = (operation); \
+	dev_info(dev, "PSR tele stage %s end ret=%d\n", label, __step_ret); \
+	__step_ret; \
+})
+
+static atomic_t psr_probe_gate = ATOMIC_INIT(0);
+
+static int psr_arm_probe(const char *val, const struct kernel_param *kp)
+{
+	if (system_state != SYSTEM_RUNNING)
+		return -EPERM;
+	if (!sysfs_streq(val, "cci1-master0-002d"))
+		return -EINVAL;
+	return atomic_cmpxchg(&psr_probe_gate, 0, 1) == 0 ? 0 : -EBUSY;
+}
+
+static int psr_get_probe_gate(char *buf, const struct kernel_param *kp)
+{
+	return scnprintf(buf, PAGE_SIZE, "%d\n", atomic_read(&psr_probe_gate));
+}
+
+static const struct kernel_param_ops psr_probe_gate_ops = {
+	.set = psr_arm_probe,
+	.get = psr_get_probe_gate,
+};
+module_param_cb(probe_once, &psr_probe_gate_ops, NULL, 0600);
+MODULE_PARM_DESC(probe_once, "Write cci1-master0-002d once after userspace starts; read 0=closed 1=armed 2=consumed");
+
+static int psr_enter_probe(struct device *dev, unsigned int address)
+{
+	if (address != 0x2d || !dev->of_node ||
+	    strcmp(dev->of_node->full_name,
+		   "/soc@0/cci@941c000/i2c-bus@0/camera@2d"))
+		return -ENODEV;
+	if (atomic_cmpxchg(&psr_probe_gate, 1, 2) != 1) {
+		dev_info(dev, "PSR tele probe gate closed; no sensor resources acquired\n");
+		return -ENODEV;
+	}
+	dev_info(dev, "PSR tele probe gate consumed for CCI1/master0/0x2d\n");
+	return 0;
+}
 
 /* Captured CFA enum1 maps to Android BGGR; CFA-BINARY-EVIDENCE.json. Verify actual phase with a captured color target;
  * do not additionally XOR the saved 0101 orientation bits into this metadata. */
@@ -92,7 +153,9 @@ static int psr_disable_rail(struct psr_s5kjn5 *s, struct regulator *reg,
 	if (!*owned)
 		return 0;
 	*owned = false;
+	dev_info(s->sd.dev, "PSR tele rail-disable bit=%u begin\n", bit);
 	ret = regulator_disable(reg);
+	dev_info(s->sd.dev, "PSR tele rail-disable bit=%u end ret=%d\n", bit, ret);
 	if (ret) {
 		s->uncertain_rails |= bit;
 		dev_err(s->sd.dev, "regulator disable failed (%d), uncertain mask %#x; restart blocked\n",
@@ -105,18 +168,24 @@ static int psr_power_off(struct device *dev)
 {
 	struct psr_s5kjn5 *s = to_psr(dev_get_drvdata(dev));
 	int ret = s->uncertain_rails ? -EIO : 0, err;
-	if (s->clock_on) { s->clock_on = false; clk_disable_unprepare(s->clk); }
+	if (s->clock_on) { s->clock_on = false;
+		dev_info(dev, "PSR tele clock-disable begin\n");
+		clk_disable_unprepare(s->clk);
+		dev_info(dev, "PSR tele clock-disable complete (void API)\n");
+	}
 	usleep_range(1000, 1500);
+	dev_info(dev, "PSR tele reset assert begin\n");
 	gpiod_set_value_cansleep(s->reset, 1);
+	dev_info(dev, "PSR tele reset assert complete (void API)\n");
 	usleep_range(1000, 1500);
 	err = psr_disable_rail(s, s->vdig, &s->vdig_on, BIT(3)); if (err && !ret) ret = err;
 	err = psr_disable_rail(s, s->vana, &s->vana_on, BIT(1)); if (err && !ret) ret = err;
 	err = psr_disable_rail(s, s->vaf, &s->vaf_on, BIT(2)); if (err && !ret) ret = err;
 	err = psr_disable_rail(s, s->vio, &s->vio_on, BIT(0)); if (err && !ret) ret = err;
-	err = pinctrl_select_state(s->pins, s->sleep); if (err && !ret) ret = err;
+	err = PSR_TELE_STEP(dev, "pins-sleep", pinctrl_select_state(s->pins, s->sleep)); if (err && !ret) ret = err;
 	if (s->cpas_owned && !ret) {
 		s->cpas_owned = false;
-		ret = mux_control_deselect(s->cpas);
+		ret = PSR_TELE_STEP(dev, "mux-deselect", mux_control_deselect(s->cpas));
 		if (ret) s->cpas_fault = true;
 	}
 	return ret;
@@ -128,25 +197,29 @@ static int psr_power_on(struct device *dev)
 	int ret, off_ret;
 	if (s->cpas_owned || s->cpas_fault || s->uncertain_rails || s->vio_on || s->vana_on || s->vaf_on || s->vdig_on || s->clock_on)
 		return -EIO;
-	ret = mux_control_select(s->cpas, 2);
+	ret = PSR_TELE_STEP(dev, "mux-select", mux_control_select(s->cpas, 2));
 	if (ret)
 		return dev_err_probe(dev, ret, "CPAS resource lease failed\n");
 	s->cpas_owned = true;
-	ret = pinctrl_select_state(s->pins, s->active);
+	ret = PSR_TELE_STEP(dev, "pins-active", pinctrl_select_state(s->pins, s->active));
 	if (ret) goto unwind;
+	dev_info(dev, "PSR tele reset assert begin\n");
 	gpiod_set_value_cansleep(s->reset, 1);
+	dev_info(dev, "PSR tele reset assert complete (void API)\n");
 	usleep_range(3000, 3500);
-	ret = regulator_enable(s->vio); if (ret) goto unwind;
+	ret = PSR_TELE_STEP(dev, "enable-vio", regulator_enable(s->vio)); if (ret) goto unwind;
 	s->vio_on = true; usleep_range(1000, 1500);
-	ret = regulator_enable(s->vaf); if (ret) goto unwind;
+	ret = PSR_TELE_STEP(dev, "enable-vaf", regulator_enable(s->vaf)); if (ret) goto unwind;
 	s->vaf_on = true; usleep_range(1000, 1500);
-	ret = regulator_enable(s->vana); if (ret) goto unwind;
+	ret = PSR_TELE_STEP(dev, "enable-vana", regulator_enable(s->vana)); if (ret) goto unwind;
 	s->vana_on = true; usleep_range(1000, 1500);
-	ret = regulator_enable(s->vdig); if (ret) goto unwind;
+	ret = PSR_TELE_STEP(dev, "enable-vdig", regulator_enable(s->vdig)); if (ret) goto unwind;
 	s->vdig_on = true; usleep_range(6000, 6500);
+	dev_info(dev, "PSR tele reset release begin\n");
 	gpiod_set_value_cansleep(s->reset, 0);
+	dev_info(dev, "PSR tele reset release complete (void API)\n");
 	usleep_range(1000, 1500);
-	ret = clk_prepare_enable(s->clk); if (ret) goto unwind;
+	ret = PSR_TELE_STEP(dev, "clock-enable", clk_prepare_enable(s->clk)); if (ret) goto unwind;
 	s->clock_on = true; usleep_range(15000, 15500);
 	return 0;
 unwind:
@@ -343,7 +416,8 @@ static int psr_probe(struct i2c_client *client)
 	struct v4l2_ctrl *link;
 	unsigned int id;
 	int ret;
-	if (client->addr != 0x2d) return -EINVAL;
+	ret = psr_enter_probe(dev, client->addr);
+	if (ret) return ret;
 	endpoint = fwnode_graph_get_next_endpoint(dev_fwnode(dev), NULL);
 	if (!endpoint) return -EINVAL;
 	ret = v4l2_fwnode_endpoint_alloc_parse(endpoint, &ep);
@@ -365,17 +439,17 @@ static int psr_probe(struct i2c_client *client)
 	s->sd.state_lock = &s->lock;
 	s->sd.flags |= V4L2_SUBDEV_FL_HAS_DEVNODE;
 	s->sd.entity.function = MEDIA_ENT_F_CAM_SENSOR;
-	s->map = devm_regmap_init_i2c(client, &psr_regmap);
+	s->map = PSR_TELE_GET(dev, "regmap", devm_regmap_init_i2c(client, &psr_regmap));
 	if (IS_ERR(s->map)) return PTR_ERR(s->map);
-	s->cpas = devm_mux_control_get(dev, "cpas");
+	s->cpas = PSR_TELE_GET(dev, "mux", devm_mux_control_get(dev, "cpas"));
 	if (IS_ERR(s->cpas)) return dev_err_probe(dev, PTR_ERR(s->cpas), "CPAS mux unavailable\n");
-	s->clk = devm_clk_get(dev, NULL);
+	s->clk = PSR_TELE_GET(dev, "clock", devm_clk_get(dev, NULL));
 	if (IS_ERR(s->clk)) return PTR_ERR(s->clk);
-	ret = clk_set_rate(s->clk, 19200000);
+	ret = PSR_TELE_STEP(dev, "clock-set-rate", clk_set_rate(s->clk, 19200000));
 	if (ret || clk_get_rate(s->clk) != 19200000) return ret ?: -EINVAL;
-	s->reset = devm_gpiod_get(dev, "reset", GPIOD_OUT_HIGH);
+	s->reset = PSR_TELE_GET(dev, "reset", devm_gpiod_get(dev, "reset", GPIOD_OUT_HIGH));
 	if (IS_ERR(s->reset)) return PTR_ERR(s->reset);
-	s->pins = devm_pinctrl_get(dev);
+	s->pins = PSR_TELE_GET(dev, "pinctrl", devm_pinctrl_get(dev));
 	if (IS_ERR(s->pins)) return PTR_ERR(s->pins);
 	/* Driver core's default must be inert; only runtime resume selects active. */
 	s->active = pinctrl_lookup_state(s->pins, "active");
@@ -384,28 +458,28 @@ static int psr_probe(struct i2c_client *client)
 	if (IS_ERR(s->sleep)) return PTR_ERR(s->sleep);
 	ret = devm_add_action_or_reset(dev, psr_sleep_pins, s);
 	if (ret) return ret;
-	s->vio = devm_regulator_get(dev, "vio");
-	s->vana = devm_regulator_get(dev, "vana");
-	s->vaf = devm_regulator_get(dev, "vaf");
-	s->vdig = devm_regulator_get(dev, "vdig");
+	s->vio = PSR_TELE_GET(dev, "vio", devm_regulator_get(dev, "vio"));
+	s->vana = PSR_TELE_GET(dev, "vana", devm_regulator_get(dev, "vana"));
+	s->vaf = PSR_TELE_GET(dev, "vaf", devm_regulator_get(dev, "vaf"));
+	s->vdig = PSR_TELE_GET(dev, "vdig", devm_regulator_get(dev, "vdig"));
 	if (IS_ERR(s->vio)) return PTR_ERR(s->vio);
 	if (IS_ERR(s->vana)) return PTR_ERR(s->vana);
 	if (IS_ERR(s->vaf)) return PTR_ERR(s->vaf);
 	if (IS_ERR(s->vdig)) return PTR_ERR(s->vdig);
-	ret = regulator_set_voltage(s->vio, 1800000, 1800000);
-	if (!ret) ret = regulator_set_voltage(s->vana, 2200000, 2200000);
-	if (!ret) ret = regulator_set_voltage(s->vaf, 3300000, 3300000);
-	if (!ret) ret = regulator_set_voltage(s->vdig, 1000000, 1000000);
-	if (!ret) ret = regulator_set_load(s->vdig, 1200000);
-	if (!ret) ret = regulator_set_load(s->vio, 600000);
-	if (!ret) ret = regulator_set_load(s->vana, 300000);
-	if (!ret) ret = regulator_set_load(s->vaf, 15000);
+	ret = PSR_TELE_STEP(dev, "voltage-vio", regulator_set_voltage(s->vio, 1800000, 1800000));
+	if (!ret) ret = PSR_TELE_STEP(dev, "voltage-vana", regulator_set_voltage(s->vana, 2200000, 2200000));
+	if (!ret) ret = PSR_TELE_STEP(dev, "voltage-vaf", regulator_set_voltage(s->vaf, 3300000, 3300000));
+	if (!ret) ret = PSR_TELE_STEP(dev, "voltage-vdig", regulator_set_voltage(s->vdig, 1000000, 1000000));
+	if (!ret) ret = PSR_TELE_STEP(dev, "load-vdig", regulator_set_load(s->vdig, 1200000));
+	if (!ret) ret = PSR_TELE_STEP(dev, "load-vio", regulator_set_load(s->vio, 600000));
+	if (!ret) ret = PSR_TELE_STEP(dev, "load-vana", regulator_set_load(s->vana, 300000));
+	if (!ret) ret = PSR_TELE_STEP(dev, "load-vaf", regulator_set_load(s->vaf, 15000));
 	if (ret) return ret;
 	ret = psr_power_on(dev);
 	if (ret) return ret;
 	/* Captured FTM identity path selects page4000, then reads16-bit ID. */
-	ret = regmap_write(s->map, 0xfcfc, 0x4000);
-	if (!ret) ret = regmap_read(s->map, 0x0000, &id);
+	ret = PSR_TELE_STEP(dev, "id-select-page", regmap_write(s->map, 0xfcfc, 0x4000));
+	if (!ret) ret = PSR_TELE_STEP(dev, "id-read", regmap_read(s->map, 0x0000, &id));
 	if (!ret && id != 0x38e5) ret = -ENODEV;
 	{
 		int off_ret = psr_power_off(dev);
