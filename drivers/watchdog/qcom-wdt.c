@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /* Copyright (c) 2014, The Linux Foundation. All rights reserved.
  */
+#include <linux/atomic.h>
 #include <linux/bits.h>
 #include <linux/clk.h>
 #include <linux/delay.h>
@@ -53,6 +54,7 @@ struct qcom_wdt {
 	unsigned long		rate;
 	void __iomem		*base;
 	const u32		*layout;
+	atomic_t		psr_immediate_count;
 };
 
 static void __iomem *wdt_addr(struct qcom_wdt *wdt, enum wdt_reg reg)
@@ -75,6 +77,32 @@ static irqreturn_t qcom_wdt_isr(int irq, void *arg)
 	return IRQ_HANDLED;
 }
 
+/* PSR diagnostic: at most 32 immediate start/stop readbacks per device. */
+static void psr_wdt_immediate_readback(struct watchdog_device *wdd,
+				       const char *stage, u32 expected_en)
+{
+	struct qcom_wdt *wdt = to_qcom_wdt(wdd);
+	u64 before, after;
+	u32 en, sts, bark, bite;
+
+	if (!of_device_is_compatible(wdd->parent->of_node,
+				     "qcom,apss-wdt-kaanapali") ||
+	    !atomic_add_unless(&wdt->psr_immediate_count, 1, 32))
+		return;
+
+	/* EN first; sequential observations, not an atomic register snapshot. */
+	before = ktime_get_ns();
+	en = readl(wdt_addr(wdt, WDT_EN));
+	sts = readl(wdt_addr(wdt, WDT_STS));
+	bark = readl(wdt_addr(wdt, WDT_BARK_TIME));
+	bite = readl(wdt_addr(wdt, WDT_BITE_TIME));
+	after = ktime_get_ns();
+	dev_info(wdd->parent,
+		 "PSR WDT immediate stage=%s before_ns=%llu after_ns=%llu programmed_rate_hz=%lu timeout=%u pretimeout=%u expected_en=%#x en=%#x sts=%#x bark=%#x bite=%#x\n",
+		 stage, before, after, wdt->rate, wdd->timeout,
+		 wdd->pretimeout, expected_en, en, sts, bark, bite);
+}
+
 static int qcom_wdt_start(struct watchdog_device *wdd)
 {
 	struct qcom_wdt *wdt = to_qcom_wdt(wdd);
@@ -85,6 +113,7 @@ static int qcom_wdt_start(struct watchdog_device *wdd)
 	writel(bark * wdt->rate, wdt_addr(wdt, WDT_BARK_TIME));
 	writel(wdd->timeout * wdt->rate, wdt_addr(wdt, WDT_BITE_TIME));
 	writel(QCOM_WDT_ENABLE, wdt_addr(wdt, WDT_EN));
+	psr_wdt_immediate_readback(wdd, "start", QCOM_WDT_ENABLE);
 	return 0;
 }
 
@@ -93,6 +122,7 @@ static int qcom_wdt_stop(struct watchdog_device *wdd)
 	struct qcom_wdt *wdt = to_qcom_wdt(wdd);
 
 	writel(0, wdt_addr(wdt, WDT_EN));
+	psr_wdt_immediate_readback(wdd, "stop", 0);
 	return 0;
 }
 
@@ -297,6 +327,7 @@ static int qcom_wdt_probe(struct platform_device *pdev)
 	wdt = devm_kzalloc(dev, sizeof(*wdt), GFP_KERNEL);
 	if (!wdt)
 		return -ENOMEM;
+	atomic_set(&wdt->psr_immediate_count, 0);
 
 	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
 	if (!res)
