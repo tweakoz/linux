@@ -276,6 +276,53 @@ static int phy_qcom_mipi_csi2_attach_pm_domains(struct mipi_csi2phy_device *csi2
 					  &csi2phy->pd_list);
 }
 
+/* Only the pinned PSR tele graph may wait for its disabled late sensor. */
+static struct fwnode_handle *psr_tele_graph_input(struct fwnode_handle *phy)
+{
+	struct fwnode_handle *ep, *remote;
+	struct device_node *expected;
+	bool matches;
+
+	/* Preserve ordinary availability semantics whenever a route exists. */
+	ep = fwnode_graph_get_endpoint_by_id(phy, 0, 0, 0);
+	if (ep || !of_machine_is_compatible("oneplus,infiniti"))
+		return ep;
+
+	expected = of_find_node_by_path("/soc@0/phy@9529000");
+	matches = expected && of_fwnode_handle(expected) == phy &&
+		of_device_is_compatible(expected, "pod,psr-tele-cphy-experimental") &&
+		of_device_is_available(expected);
+	of_node_put(expected);
+	if (!matches)
+		return NULL;
+
+	ep = fwnode_graph_get_endpoint_by_id(phy, 0, 0,
+					     FWNODE_GRAPH_DEVICE_DISABLED);
+	if (!ep)
+		return NULL;
+	remote = fwnode_graph_get_remote_endpoint(ep);
+	expected = of_find_node_by_path("/soc@0/cci@941c000/i2c-bus@0/camera@2d/port/endpoint");
+	matches = expected && remote == of_fwnode_handle(expected);
+	of_node_put(expected);
+	fwnode_handle_put(remote);
+	if (!matches) {
+		fwnode_handle_put(ep);
+		return NULL;
+	}
+	remote = fwnode_graph_get_remote_port_parent(ep);
+	expected = of_find_node_by_path("/soc@0/cci@941c000/i2c-bus@0/camera@2d");
+	matches = expected && remote == of_fwnode_handle(expected) &&
+		of_device_is_compatible(expected, "pod,psr-s5kjn5-fixed") &&
+		!of_device_is_available(expected);
+	of_node_put(expected);
+	fwnode_handle_put(remote);
+	if (!matches) {
+		fwnode_handle_put(ep);
+		return NULL;
+	}
+	return ep;
+}
+
 static int phy_qcom_mipi_csi2_parse_routing(struct mipi_csi2phy_device *csi2phy)
 {
 	struct mipi_csi2phy_stream_cfg *stream_cfg = &csi2phy->stream_cfg;
@@ -295,7 +342,9 @@ static int phy_qcom_mipi_csi2_parse_routing(struct mipi_csi2phy_device *csi2phy)
 		return -EOPNOTSUPP;
 	}
 
-	ep = fwnode_graph_get_endpoint_by_id(dev_fwnode(dev), 0, 0, 0);
+	ep = csi2phy->soc_cfg == &mipi_csi2_cphy_psr_tele ?
+		psr_tele_graph_input(dev_fwnode(dev)) :
+		fwnode_graph_get_endpoint_by_id(dev_fwnode(dev), 0, 0, 0);
 	if (!ep) {
 		dev_err(dev, "Missing port@0\n");
 		return -ENODEV;

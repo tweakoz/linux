@@ -185,7 +185,7 @@ static void psr_activate_work(struct work_struct *work)
 	if (!bound) { ret = -ENODEV; goto failed; }
 	WRITE_ONCE(psr_activation_error, 0);
 	atomic_set(&psr_activation, PSR_BOUND);
-	pr_info("PSR tele activation bound; chip-ID probe only, no capture route enabled\n");
+	pr_info("PSR tele activation bound; chip-ID probe complete, capture graph prepared\n");
 	return;
 failed:
 	/* Revoke an unconsumed arm so a delayed probe cannot start sensor I/O.

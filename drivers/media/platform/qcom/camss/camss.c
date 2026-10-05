@@ -5102,6 +5102,53 @@ static int camss_parse_endpoint_node(struct device *dev,
 	return 0;
 }
 
+/* Only the pinned PSR tele graph may wait for its disabled late sensor. */
+static struct fwnode_handle *psr_tele_graph_input(struct fwnode_handle *phy)
+{
+	struct fwnode_handle *ep, *remote;
+	struct device_node *expected;
+	bool matches;
+
+	/* Preserve ordinary availability semantics whenever a route exists. */
+	ep = fwnode_graph_get_endpoint_by_id(phy, 0, 0, 0);
+	if (ep || !of_machine_is_compatible("oneplus,infiniti"))
+		return ep;
+
+	expected = of_find_node_by_path("/soc@0/phy@9529000");
+	matches = expected && of_fwnode_handle(expected) == phy &&
+		of_device_is_compatible(expected, "pod,psr-tele-cphy-experimental") &&
+		of_device_is_available(expected);
+	of_node_put(expected);
+	if (!matches)
+		return NULL;
+
+	ep = fwnode_graph_get_endpoint_by_id(phy, 0, 0,
+					     FWNODE_GRAPH_DEVICE_DISABLED);
+	if (!ep)
+		return NULL;
+	remote = fwnode_graph_get_remote_endpoint(ep);
+	expected = of_find_node_by_path("/soc@0/cci@941c000/i2c-bus@0/camera@2d/port/endpoint");
+	matches = expected && remote == of_fwnode_handle(expected);
+	of_node_put(expected);
+	fwnode_handle_put(remote);
+	if (!matches) {
+		fwnode_handle_put(ep);
+		return NULL;
+	}
+	remote = fwnode_graph_get_remote_port_parent(ep);
+	expected = of_find_node_by_path("/soc@0/cci@941c000/i2c-bus@0/camera@2d");
+	matches = expected && remote == of_fwnode_handle(expected) &&
+		of_device_is_compatible(expected, "pod,psr-s5kjn5-fixed") &&
+		!of_device_is_available(expected);
+	of_node_put(expected);
+	fwnode_handle_put(remote);
+	if (!matches) {
+		fwnode_handle_put(ep);
+		return NULL;
+	}
+	return ep;
+}
+
 /*
  * camss_parse_ports - Parse ports node
  * @dev: CAMSS device
@@ -5136,7 +5183,7 @@ static int camss_parse_ports(struct camss *camss)
 			if (!phy_node)
 				continue;
 
-			phy_in = fwnode_graph_get_endpoint_by_id(phy_node, 0, 0, 0);
+			phy_in = psr_tele_graph_input(phy_node);
 			fwnode_handle_put(phy_node);
 			if (!phy_in)
 				continue;
