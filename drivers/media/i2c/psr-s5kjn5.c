@@ -4,6 +4,9 @@
  * Captured bounded exposure/gain controls; no guessed VT pixel rate, blanking or frame interval.
  */
 #include <linux/atomic.h>
+#include <linux/completion.h>
+#include <linux/workqueue.h>
+#include <linux/device.h>
 #include <linux/kernel.h>
 #include <linux/of.h>
 #include <linux/clk.h>
@@ -86,6 +89,142 @@ static int psr_enter_probe(struct device *dev, unsigned int address)
 	dev_info(dev, "PSR tele probe gate consumed for CCI1/master0/0x2d\n");
 	return 0;
 }
+
+/* Fixed diagnostic control, built in with this sensor. Storage intentionally
+ * lasts for the boot: notifier failure may leave a populated device behind. */
+#define PSR_TELE_NODE "/soc@0/cci@941c000/i2c-bus@0/camera@2d"
+enum psr_activation_state { PSR_CLOSED, PSR_QUEUED, PSR_APPLYING,
+	PSR_BOUND, PSR_FAILED };
+static atomic_t psr_activation = ATOMIC_INIT(PSR_CLOSED);
+static int psr_activation_error;
+static DECLARE_COMPLETION(psr_probe_finished);
+static int psr_probe_result = -EINPROGRESS;
+static struct of_changeset psr_activation_changeset;
+static struct device_node *psr_activation_node;
+
+struct psr_property_pin { const char *node, *name; const u8 *data; size_t size; };
+#include "psr-tele-activation-pins.h"
+
+static int psr_validate_activation(void)
+{
+	struct device_node *node;
+	struct i2c_adapter *adapter;
+	struct i2c_client *client;
+	struct property *prop;
+	int length, i, ret = 0;
+
+	for (i = 0; i < ARRAY_SIZE(psr_available_nodes); i++) {
+		node = of_find_node_by_path(psr_available_nodes[i]);
+		if (!node) return -ENODEV;
+		if (!of_device_is_available(node)) ret = -ENODEV;
+		if (!strcmp(psr_available_nodes[i], "/soc@0/rsc@18900000/regulators-0/ldo16") &&
+		    (of_property_read_bool(node, "regulator-boot-on") ||
+		     of_property_read_bool(node, "regulator-always-on"))) ret = -EINVAL;
+		of_node_put(node);
+		if (ret) return ret;
+	}
+	for (i = 0; i < ARRAY_SIZE(psr_property_pins); i++) {
+		const struct psr_property_pin *pin = &psr_property_pins[i];
+		node = of_find_node_by_path(pin->node);
+		if (!node) return -ENODEV;
+		prop = of_find_property(node, pin->name, &length);
+		if (!prop || length != pin->size || (length && memcmp(prop->value, pin->data, length)))
+			ret = -EINVAL;
+		of_node_put(node);
+		if (ret) return ret;
+	}
+	node = of_find_node_by_path(PSR_TELE_NODE);
+	if (!node) return -ENODEV;
+	if (of_node_check_flag(node, OF_POPULATED)) ret = -EBUSY;
+	client = of_find_i2c_device_by_node(node);
+	if (client) { put_device(&client->dev); ret = -EBUSY; }
+	adapter = of_find_i2c_adapter_by_node(node->parent);
+	if (!adapter) ret = -ENODEV;
+	else put_device(&adapter->dev);
+	of_node_put(node);
+	return ret;
+}
+
+static void psr_activate_work(struct work_struct *work)
+{
+	struct i2c_client *client;
+	unsigned long deadline = jiffies + msecs_to_jiffies(30000), now;
+	bool bound = false;
+	int ret = psr_validate_activation();
+
+	if (ret) goto failed;
+	if (atomic_cmpxchg(&psr_probe_gate, 0, 1) != 0) { ret = -EBUSY; goto failed; }
+	psr_activation_node = of_find_node_by_path(PSR_TELE_NODE);
+	if (!psr_activation_node) { ret = -ENODEV; goto failed; }
+	of_changeset_init(&psr_activation_changeset);
+	ret = of_changeset_update_prop_string(&psr_activation_changeset,
+		psr_activation_node, "status", "okay");
+	if (ret) goto failed;
+	atomic_set(&psr_activation, PSR_APPLYING);
+	/* This call can block in driver core/notifiers. The external watchdog,
+	 * not the observation timeout below, must cover that entire interval. */
+	ret = of_changeset_apply(&psr_activation_changeset);
+	if (ret) goto failed;
+	now = jiffies;
+	if (time_after_eq(now, deadline) ||
+	    !wait_for_completion_timeout(&psr_probe_finished, deadline - now)) {
+		ret = -ETIMEDOUT; goto failed;
+	}
+	ret = READ_ONCE(psr_probe_result);
+	if (ret) goto failed;
+	/* Probe completion precedes driver_bound(). Device lock synchronizes
+	 * with the core's completion of binding; it too may block. */
+	client = of_find_i2c_device_by_node(psr_activation_node);
+	if (!client) { ret = -ENODEV; goto failed; }
+	device_lock(&client->dev);
+	bound = device_is_bound(&client->dev) && client->dev.driver &&
+		!strcmp(client->dev.driver->name, "psr-s5kjn5-fixed");
+	device_unlock(&client->dev);
+	put_device(&client->dev);
+	if (time_after_eq(jiffies, deadline)) { ret = -ETIMEDOUT; goto failed; }
+	if (!bound) { ret = -ENODEV; goto failed; }
+	WRITE_ONCE(psr_activation_error, 0);
+	atomic_set(&psr_activation, PSR_BOUND);
+	pr_info("PSR tele activation bound; chip-ID probe only, no capture route enabled\n");
+	return;
+failed:
+	/* Revoke an unconsumed arm so a delayed probe cannot start sensor I/O.
+	 * A probe already in progress stays consumed; core work is not canceled. */
+	atomic_cmpxchg(&psr_probe_gate, 1, 2);
+	WRITE_ONCE(psr_activation_error, ret);
+	atomic_set(&psr_activation, PSR_FAILED);
+	pr_err("PSR tele activation failed %d; consumed until reboot, no rollback\n", ret);
+}
+static DECLARE_WORK(psr_activation_work, psr_activate_work);
+
+static int psr_activate_once(const char *val, const struct kernel_param *kp)
+{
+	int ret;
+	if (system_state != SYSTEM_RUNNING) return -EPERM;
+	if (!sysfs_streq(val, "create-cci1-master0-002d")) return -EINVAL;
+	if (atomic_read(&psr_probe_gate) != 0) return -EBUSY;
+	ret = psr_validate_activation();
+	if (ret) return ret;
+	if (atomic_cmpxchg(&psr_activation, PSR_CLOSED, PSR_QUEUED) != PSR_CLOSED)
+		return -EBUSY;
+	if (!schedule_work(&psr_activation_work)) {
+		WRITE_ONCE(psr_activation_error, -EBUSY);
+		atomic_set(&psr_activation, PSR_FAILED);
+		return -EBUSY;
+	}
+	return 0;
+}
+static int psr_activation_status(char *buf, const struct kernel_param *kp)
+{
+	return scnprintf(buf, PAGE_SIZE, "state=%d error=%d probe=%d\n",
+		atomic_read(&psr_activation), READ_ONCE(psr_activation_error),
+		READ_ONCE(psr_probe_result));
+}
+static const struct kernel_param_ops psr_activation_ops = {
+	.set = psr_activate_once, .get = psr_activation_status,
+};
+module_param_cb(activate_once, &psr_activation_ops, NULL, 0600);
+MODULE_PARM_DESC(activate_once, "One exact userspace device creation; 0 closed,1 queued,2 applying,3 bound,4 failed; no retry");
 
 /* Captured CFA enum1 maps to Android BGGR; CFA-BINARY-EVIDENCE.json. Verify actual phase with a captured color target;
  * do not additionally XOR the saved 0101 orientation bits into this metadata. */
@@ -413,7 +552,7 @@ static const struct v4l2_subdev_ops psr_ops = { .pad = &psr_pad_ops, .video = &p
 static const struct v4l2_subdev_internal_ops psr_internal_ops = { .init_state = psr_init_state };
 static const struct regmap_config psr_regmap = { .reg_bits = 16, .val_bits = 16 };
 
-static int psr_probe(struct i2c_client *client)
+static int psr_probe_inner(struct i2c_client *client)
 {
 	struct device *dev = &client->dev;
 	struct v4l2_fwnode_endpoint ep = { .bus_type = V4L2_MBUS_CSI2_CPHY };
@@ -526,6 +665,15 @@ entity:
 controls:
 	v4l2_ctrl_handler_free(&s->ctrls);
 	return ret;
+}
+static int psr_probe(struct i2c_client *client)
+{
+ int ret = psr_probe_inner(client);
+ if (atomic_read(&psr_activation) == PSR_APPLYING && client->dev.of_node == psr_activation_node) {
+  WRITE_ONCE(psr_probe_result, ret);
+  complete_all(&psr_probe_finished);
+ }
+ return ret;
 }
 static void psr_remove(struct i2c_client *client)
 {
