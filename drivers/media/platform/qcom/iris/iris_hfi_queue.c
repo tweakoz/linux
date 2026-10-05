@@ -8,6 +8,7 @@
 #include "iris_core.h"
 #include "iris_hfi_queue.h"
 #include "iris_vpu_common.h"
+#include "iris_psr_hfi_trace.h"
 
 static int iris_hfi_queue_write(struct iris_iface_q_info *qinfo, void *packet, u32 packet_size)
 {
@@ -113,13 +114,17 @@ int iris_hfi_queue_cmd_write_locked(struct iris_core *core, void *pkt, u32 pkt_s
 {
 	struct iris_iface_q_info *q_info = &core->command_queue;
 
-	if (core->state == IRIS_CORE_ERROR || core->state == IRIS_CORE_DEINIT)
+	if (core->state == IRIS_CORE_ERROR || core->state == IRIS_CORE_DEINIT) {
+		iris_psr_hfi_trace_header(core, "enqueue-rejected", pkt, pkt_size, -EINVAL);
 		return -EINVAL;
+	}
 
 	if (!iris_hfi_queue_write(q_info, pkt, pkt_size)) {
 		iris_vpu_raise_interrupt(core);
+		iris_psr_hfi_trace_header(core, "enqueue", pkt, pkt_size, 0);
 	} else {
 		dev_err(core->dev, "queue full\n");
+		iris_psr_hfi_trace_header(core, "enqueue-rejected", pkt, pkt_size, -ENODATA);
 		return -ENODATA;
 	}
 

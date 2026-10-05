@@ -17,6 +17,7 @@
 #include "iris_vdec.h"
 #include "iris_vpu_buffer.h"
 #include "iris_vpu_common.h"
+#include "iris_psr_hfi_trace.h"
 
 struct iris_hfi_gen2_core_hfi_range {
 	u32 begin;
@@ -550,6 +551,17 @@ static int iris_hfi_gen2_handle_output_buffer(struct iris_inst *inst,
 	return 0;
 }
 
+static void iris_psr_hfi_vb2_done(struct iris_inst *inst, struct iris_buffer *buf)
+{
+	u32 type = buf->type, index = buf->index;
+	u32 attr = buf->attr, data_size = buf->data_size;
+	int ret;
+
+	ret = iris_vb2_buffer_done(inst, buf);
+	iris_psr_hfi_trace_done(inst->core, inst->session_id,
+				type, index, attr, data_size, ret);
+}
+
 static void iris_hfi_gen2_handle_dequeue_buffers(struct iris_inst *inst)
 {
 	struct v4l2_m2m_ctx *m2m_ctx = inst->m2m_ctx;
@@ -562,7 +574,7 @@ static void iris_hfi_gen2_handle_dequeue_buffers(struct iris_inst *inst)
 			buf->attr &= ~BUF_ATTR_DEQUEUED;
 			if (!(buf->attr & BUF_ATTR_BUFFER_DONE)) {
 				buf->attr |= BUF_ATTR_BUFFER_DONE;
-				iris_vb2_buffer_done(inst, buf);
+				iris_psr_hfi_vb2_done(inst, buf);
 			}
 		}
 	}
@@ -573,7 +585,7 @@ static void iris_hfi_gen2_handle_dequeue_buffers(struct iris_inst *inst)
 			buf->attr &= ~BUF_ATTR_DEQUEUED;
 			if (!(buf->attr & BUF_ATTR_BUFFER_DONE)) {
 				buf->attr |= BUF_ATTR_BUFFER_DONE;
-				iris_vb2_buffer_done(inst, buf);
+				iris_psr_hfi_vb2_done(inst, buf);
 			}
 		}
 	}
@@ -1110,6 +1122,9 @@ static int iris_hfi_gen2_handle_session_response(struct iris_core *core,
 			if (packet->type > range[i].begin && packet->type < range[i].end) {
 				dequeue |= (packet->type == HFI_CMD_BUFFER);
 				ret = range[i].handle(inst, packet);
+				iris_psr_hfi_trace_packet(core, "dispatch", hdr->session_id,
+							  hdr->header_id, packet, packet->size,
+							  ret, inst->state);
 				if (ret)
 					iris_inst_change_state(inst, IRIS_INST_ERROR);
 			}
@@ -1133,6 +1148,8 @@ static int iris_hfi_gen2_handle_response(struct iris_core *core, void *response)
 	ret = iris_hfi_gen2_validate_hdr_packet(core, hdr);
 	if (ret)
 		return iris_hfi_gen2_handle_system_error(core, NULL);
+
+	iris_psr_hfi_trace_header(core, "receive", hdr, hdr->size, 0);
 
 	if (!hdr->session_id)
 		return iris_hfi_gen2_handle_system_response(core, hdr);

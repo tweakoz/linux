@@ -7,6 +7,7 @@
 #include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/kernel.h>
+#include <linux/ktime.h>
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
@@ -246,6 +247,36 @@ static int qcom_wdt_get_bootstatus(struct device *dev, struct qcom_wdt *wdt,
 	return 0;
 }
 
+/* PSR diagnostic only: the OEM driver reads these same four registers. */
+static ssize_t psr_registers_show(struct device *dev,
+				 struct device_attribute *attr, char *buf)
+{
+	struct qcom_wdt *wdt = dev_get_drvdata(dev);
+	u64 before, after;
+	u32 sts, en, bark, bite;
+
+	/* Sequential, non-atomic observation; never reset/pet/enable here. */
+	before = ktime_get_ns();
+	sts = readl(wdt_addr(wdt, WDT_STS));
+	en = readl(wdt_addr(wdt, WDT_EN));
+	bark = readl(wdt_addr(wdt, WDT_BARK_TIME));
+	bite = readl(wdt_addr(wdt, WDT_BITE_TIME));
+	after = ktime_get_ns();
+
+	return sysfs_emit(buf,
+		"before_ns=%llu after_ns=%llu programmed_rate_hz=%lu en=%#x sts=%#x bark=%#x bite=%#x\n",
+		before, after, wdt->rate, en, sts, bark, bite);
+}
+static DEVICE_ATTR_RO(psr_registers);
+
+static struct attribute *psr_wdt_attrs[] = {
+	&dev_attr_psr_registers.attr,
+	NULL,
+};
+static const struct attribute_group psr_wdt_group = {
+	.attrs = psr_wdt_attrs,
+};
+
 static int qcom_wdt_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -355,6 +386,11 @@ static int qcom_wdt_probe(struct platform_device *pdev)
 		return ret;
 
 	platform_set_drvdata(pdev, wdt);
+	if (of_device_is_compatible(np, "qcom,apss-wdt-kaanapali")) {
+		ret = devm_device_add_group(dev, &psr_wdt_group);
+		if (ret)
+			dev_warn(dev, "PSR watchdog register trace unavailable: %d\n", ret);
+	}
 	return 0;
 }
 
