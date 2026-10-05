@@ -5102,32 +5102,48 @@ static int camss_parse_endpoint_node(struct device *dev,
 	return 0;
 }
 
-/* Only the pinned PSR tele graph may wait for its disabled late sensor. */
-static struct fwnode_handle *psr_tele_graph_input(struct fwnode_handle *phy)
+/* Only these exact PSR routes may wait for their disabled late sensors. */
+static struct fwnode_handle *psr_late_graph_input(struct fwnode_handle *phy)
 {
+	static const struct {
+		const char *phy, *phy_compatible, *sensor, *sensor_compatible, *endpoint;
+	} routes[] = {
+		{ "/soc@0/phy@9529000", "pod,psr-tele-cphy-experimental",
+		  "/soc@0/cci@941c000/i2c-bus@0/camera@2d", "pod,psr-s5kjn5-fixed",
+		  "/soc@0/cci@941c000/i2c-bus@0/camera@2d/port/endpoint" },
+		{ "/soc@0/phy@952b000", "qcom,kaanapali-csi2-phy",
+		  "/soc@0/geniqup@8c0000/i2c@884000/camera@10", "pod,psr-imx709-fixed",
+		  "/soc@0/geniqup@8c0000/i2c@884000/camera@10/port/endpoint" },
+		{ "/soc@0/phy@952d000", "pod,psr-main-cphy-experimental",
+		  "/soc@0/cci@941b000/i2c-bus@1/camera@1a", "pod,psr-imx906-fixed",
+		  "/soc@0/cci@941b000/i2c-bus@1/camera@1a/port/endpoint" },
+	};
 	struct fwnode_handle *ep, *remote;
 	struct device_node *expected;
+	unsigned int i;
 	bool matches;
 
-	/* Preserve ordinary availability semantics whenever a route exists. */
 	ep = fwnode_graph_get_endpoint_by_id(phy, 0, 0, 0);
 	if (ep || !of_machine_is_compatible("oneplus,infiniti"))
 		return ep;
 
-	expected = of_find_node_by_path("/soc@0/phy@9529000");
-	matches = expected && of_fwnode_handle(expected) == phy &&
-		of_device_is_compatible(expected, "pod,psr-tele-cphy-experimental") &&
-		of_device_is_available(expected);
-	of_node_put(expected);
-	if (!matches)
+	for (i = 0; i < ARRAY_SIZE(routes); i++) {
+		expected = of_find_node_by_path(routes[i].phy);
+		matches = expected && of_fwnode_handle(expected) == phy &&
+			of_device_is_compatible(expected, routes[i].phy_compatible) &&
+			of_device_is_available(expected);
+		of_node_put(expected);
+		if (matches)
+			break;
+	}
+	if (i == ARRAY_SIZE(routes))
 		return NULL;
-
 	ep = fwnode_graph_get_endpoint_by_id(phy, 0, 0,
 					     FWNODE_GRAPH_DEVICE_DISABLED);
 	if (!ep)
 		return NULL;
 	remote = fwnode_graph_get_remote_endpoint(ep);
-	expected = of_find_node_by_path("/soc@0/cci@941c000/i2c-bus@0/camera@2d/port/endpoint");
+	expected = of_find_node_by_path(routes[i].endpoint);
 	matches = expected && remote == of_fwnode_handle(expected);
 	of_node_put(expected);
 	fwnode_handle_put(remote);
@@ -5136,9 +5152,9 @@ static struct fwnode_handle *psr_tele_graph_input(struct fwnode_handle *phy)
 		return NULL;
 	}
 	remote = fwnode_graph_get_remote_port_parent(ep);
-	expected = of_find_node_by_path("/soc@0/cci@941c000/i2c-bus@0/camera@2d");
+	expected = of_find_node_by_path(routes[i].sensor);
 	matches = expected && remote == of_fwnode_handle(expected) &&
-		of_device_is_compatible(expected, "pod,psr-s5kjn5-fixed") &&
+		of_device_is_compatible(expected, routes[i].sensor_compatible) &&
 		!of_device_is_available(expected);
 	of_node_put(expected);
 	fwnode_handle_put(remote);
@@ -5183,7 +5199,7 @@ static int camss_parse_ports(struct camss *camss)
 			if (!phy_node)
 				continue;
 
-			phy_in = psr_tele_graph_input(phy_node);
+			phy_in = psr_late_graph_input(phy_node);
 			fwnode_handle_put(phy_node);
 			if (!phy_in)
 				continue;
