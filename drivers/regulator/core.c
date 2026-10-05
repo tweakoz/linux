@@ -5754,10 +5754,22 @@ static const struct attribute_group *regulator_dev_groups[] = {
 	NULL
 };
 
+/* Diagnostic only: do not dereference descriptor or invoke provider callbacks. */
+static void regulator_psr_lifecycle(struct device *dev,
+                                    struct regulator_dev *rdev,
+                                    const char *stage)
+{
+ pr_info("PSR regulator lifecycle %s dev=%s parent=%s of=%pOF rdev=%p desc=%p constraints=%p\n",
+         stage, dev_name(dev), dev->parent ? dev_name(dev->parent) : "none",
+         dev->of_node, rdev, READ_ONCE(rdev->desc),
+         READ_ONCE(rdev->constraints));
+}
+
 static void regulator_dev_release(struct device *dev)
 {
 	struct regulator_dev *rdev = dev_get_drvdata(dev);
 
+	regulator_psr_lifecycle(dev, rdev, "release");
 	debugfs_remove_recursive(rdev->debugfs);
 	kfree(rdev->constraints);
 	of_node_put(rdev->dev.of_node);
@@ -6211,6 +6223,7 @@ regulator_register(struct device *dev,
 	ret = device_add(&rdev->dev);
 	if (ret != 0)
 		goto unset_supplies;
+	regulator_psr_lifecycle(&rdev->dev, rdev, "registered");
 
 	if (!tried_supply_resolve) {
 		/*
@@ -6809,6 +6822,7 @@ static int regulator_late_cleanup(struct device *dev, void *data)
 	struct regulation_constraints *c = rdev->constraints;
 	int ret;
 
+	regulator_psr_lifecycle(dev, rdev, "late-entry");
 	if (c && c->always_on)
 		return 0;
 
@@ -6816,6 +6830,7 @@ static int regulator_late_cleanup(struct device *dev, void *data)
 		return 0;
 
 	regulator_lock(rdev);
+	regulator_psr_lifecycle(dev, rdev, "late-locked");
 
 	if (rdev->use_count)
 		goto unlock;
