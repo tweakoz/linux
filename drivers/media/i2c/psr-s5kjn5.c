@@ -25,6 +25,7 @@
 #include <media/v4l2-fwnode.h>
 #include <media/v4l2-subdev.h>
 #include "psr-s5kjn5-tables.h"
+#include "psr-dw9827c.h"
 
 /* Diagnostic gate: never arm via an early kernel command line. One write and
  * one probe attempt per boot; a failed attempt cannot silently retry hardware.
@@ -236,6 +237,7 @@ struct psr_s5kjn5 {
 	struct v4l2_ctrl_handler ctrls;
 	struct mutex lock;
 	struct v4l2_ctrl *exposure_gain[2];
+	struct psr_focus focus;
 	bool configured, stream_fault;
 	struct regmap *map;
 	struct i2c_client *client;
@@ -313,6 +315,7 @@ static int psr_power_off(struct device *dev)
 {
 	struct psr_s5kjn5 *s = to_psr(dev_get_drvdata(dev));
 	int ret = s->uncertain_rails ? -EIO : 0, err;
+	err = psr_focus_end(&s->focus); if (err && !ret) ret = err;
 	if (s->clock_on) { s->clock_on = false;
 		dev_info(dev, "PSR tele clock-disable begin\n");
 		clk_disable_unprepare(s->clk);
@@ -454,7 +457,8 @@ static int psr_set_ctrl(struct v4l2_ctrl *ctrl)
 	int ret;
 
 	if (ctrl->id != V4L2_CID_EXPOSURE &&
-	    ctrl->id != V4L2_CID_TEST_PATTERN)
+	    ctrl->id != V4L2_CID_TEST_PATTERN &&
+	    ctrl->id != V4L2_CID_FOCUS_ABSOLUTE)
 		return -EINVAL;
 	if (s->stream_fault)
 		return -EIO;
@@ -463,7 +467,9 @@ static int psr_set_ctrl(struct v4l2_ctrl *ctrl)
 	ret = pm_runtime_get_if_in_use(dev);
 	if (ret <= 0)
 		return ret < 0 ? ret : 0;
-	if (ctrl->id == V4L2_CID_TEST_PATTERN)
+	if (ctrl->id == V4L2_CID_FOCUS_ABSOLUTE)
+		ret = psr_focus_set(&s->focus, ctrl->val);
+	else if (ctrl->id == V4L2_CID_TEST_PATTERN)
 		ret = psr_apply_test_pattern(s, ctrl->val);
 	else
 		ret = psr_apply_exposure(s, s->exposure_gain[0]->val,
@@ -498,6 +504,7 @@ static int psr_enable(struct v4l2_subdev *sd, struct v4l2_subdev_state *state,
 	s->stream_fault = false;
 	ret = psr_write(s, psr_init, ARRAY_SIZE(psr_init));
 	if (!ret) ret = psr_write(s, psr_mode11, ARRAY_SIZE(psr_mode11));
+	if (!ret) ret = psr_focus_begin(&s->focus);
 	if (!ret) {
 		s->configured = true;
 		ret = __v4l2_ctrl_handler_setup(&s->ctrls);
@@ -681,7 +688,9 @@ static int psr_probe_inner(struct i2c_client *client)
 		if (!ret) ret = off_ret;
 	}
 	if (ret) return dev_err_probe(dev, ret, "S5KJN5 identity check failed\n");
-	v4l2_ctrl_handler_init(&s->ctrls, 5);
+	ret = psr_focus_init(&s->focus, client, &psr_focus_tele);
+	if (ret) return dev_err_probe(dev, ret, "focus address reservation failed\n");
+	v4l2_ctrl_handler_init(&s->ctrls, 6);
 	s->ctrls.lock = &s->lock;
 	link = v4l2_ctrl_new_int_menu(&s->ctrls, NULL, V4L2_CID_LINK_FREQ, 0, 0, psr_link_freq);
 	if (link) link->flags |= V4L2_CTRL_FLAG_READ_ONLY;
@@ -697,6 +706,9 @@ static int psr_probe_inner(struct i2c_client *client)
 		0, 0, psr_test_pattern_menu);
 	if (!s->ctrls.error)
 		v4l2_ctrl_cluster(ARRAY_SIZE(s->exposure_gain), s->exposure_gain);
+	v4l2_ctrl_new_std(&s->ctrls, &psr_ctrl_ops, V4L2_CID_FOCUS_ABSOLUTE,
+		psr_focus_tele.minimum, psr_focus_tele.maximum, 1,
+		psr_focus_tele.initial);
 	ret = s->ctrls.error;
 	if (ret) goto controls;
 	s->sd.ctrl_handler = &s->ctrls;
