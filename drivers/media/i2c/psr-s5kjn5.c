@@ -403,13 +403,58 @@ static int psr_apply_exposure(struct psr_s5kjn5 *s, u32 exposure, u32 gain)
 	return ret ?: release_ret;
 }
 
+/* Captured PSR tele TestPatternInfo contains WORD writes 0600=0..3.
+ * Same-ID upstream S5KJN5 names these disabled/solid/bars/fade. No PN9
+ * is exposed because it is absent from this phone's captured module.
+ */
+static const char * const psr_test_pattern_menu[] = {
+	"Disabled", "Solid Color", "Color Bars", "Fade To Grey Color Bars",
+};
+
+static int psr_apply_test_pattern(struct psr_s5kjn5 *s, u32 pattern)
+{
+	const struct psr_reg values[] = {
+		{ 0xfcfc, 0x4000, 2, 0 },
+		{ 0x0600, pattern, 2, 0 },
+	};
+
+	if (pattern >= ARRAY_SIZE(psr_test_pattern_menu))
+		return -ERANGE;
+	return psr_write(s, values, ARRAY_SIZE(values));
+}
+
+/* Diagnostic only: the existing init/mode/control transaction leaves page
+ * 4000 selected. regmap has no cache, so each successful read is physical.
+ * Read failures are logged without changing the stream callback's result.
+ * No retries, page writes, PM references or actuator/OIS operations here.
+ */
+static void psr_readback(struct psr_s5kjn5 *s, bool started)
+{
+	static const unsigned int configured[] = {
+		0x0112, 0x0114, 0x0340, 0x0342, 0x034c, 0x034e,
+		0x0202, 0x0204, 0x020e, 0x0600,
+	};
+	unsigned int i, value, reg;
+	int ret;
+
+	for (i = 0; i < (started ? 1 : ARRAY_SIZE(configured)); i++) {
+		reg = started ? 0x0100 : configured[i];
+		value = 0;
+		ret = regmap_read(s->map, reg, &value);
+		dev_info(s->sd.dev,
+			 "PSR tele diagnostic readback started=%u page=4000 reg=%04x ret=%d value=%04x\n",
+			 started, reg, ret, value);
+	}
+}
+
 static int psr_set_ctrl(struct v4l2_ctrl *ctrl)
 {
 	struct psr_s5kjn5 *s = container_of(ctrl->handler, struct psr_s5kjn5, ctrls);
 	struct device *dev = s->sd.dev;
 	int ret;
 
-	if (ctrl->id != V4L2_CID_EXPOSURE)
+	if (ctrl->id != V4L2_CID_EXPOSURE &&
+	    ctrl->id != V4L2_CID_TEST_PATTERN)
 		return -EINVAL;
 	if (s->stream_fault)
 		return -EIO;
@@ -418,8 +463,11 @@ static int psr_set_ctrl(struct v4l2_ctrl *ctrl)
 	ret = pm_runtime_get_if_in_use(dev);
 	if (ret <= 0)
 		return ret < 0 ? ret : 0;
-	ret = psr_apply_exposure(s, s->exposure_gain[0]->val,
-				 s->exposure_gain[1]->val);
+	if (ctrl->id == V4L2_CID_TEST_PATTERN)
+		ret = psr_apply_test_pattern(s, ctrl->val);
+	else
+		ret = psr_apply_exposure(s, s->exposure_gain[0]->val,
+					 s->exposure_gain[1]->val);
 	if (ret) {
 		int off_ret;
 		/* Do not consume the stream PM reference: disable_streams owns it. */
@@ -454,7 +502,9 @@ static int psr_enable(struct v4l2_subdev *sd, struct v4l2_subdev_state *state,
 		s->configured = true;
 		ret = __v4l2_ctrl_handler_setup(&s->ctrls);
 	}
+	if (!ret) psr_readback(s, false);
 	if (!ret) ret = psr_write(s, psr_on, ARRAY_SIZE(psr_on));
+	if (!ret) psr_readback(s, true);
 	if (ret) {
 		int off_ret;
 		s->configured = false;
@@ -631,7 +681,7 @@ static int psr_probe_inner(struct i2c_client *client)
 		if (!ret) ret = off_ret;
 	}
 	if (ret) return dev_err_probe(dev, ret, "S5KJN5 identity check failed\n");
-	v4l2_ctrl_handler_init(&s->ctrls, 4);
+	v4l2_ctrl_handler_init(&s->ctrls, 5);
 	s->ctrls.lock = &s->lock;
 	link = v4l2_ctrl_new_int_menu(&s->ctrls, NULL, V4L2_CID_LINK_FREQ, 0, 0, psr_link_freq);
 	if (link) link->flags |= V4L2_CTRL_FLAG_READ_ONLY;
@@ -642,6 +692,9 @@ static int psr_probe_inner(struct i2c_client *client)
 	link = v4l2_ctrl_new_std(&s->ctrls, NULL, V4L2_CID_DIGITAL_GAIN,
 		256, 256, 1, 256);
 	if (link) link->flags |= V4L2_CTRL_FLAG_READ_ONLY;
+	v4l2_ctrl_new_std_menu_items(&s->ctrls, &psr_ctrl_ops,
+		V4L2_CID_TEST_PATTERN, ARRAY_SIZE(psr_test_pattern_menu) - 1,
+		0, 0, psr_test_pattern_menu);
 	if (!s->ctrls.error)
 		v4l2_ctrl_cluster(ARRAY_SIZE(s->exposure_gain), s->exposure_gain);
 	ret = s->ctrls.error;
