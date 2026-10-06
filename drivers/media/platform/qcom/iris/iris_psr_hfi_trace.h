@@ -2,17 +2,79 @@
 #ifndef __IRIS_PSR_HFI_TRACE_H__
 #define __IRIS_PSR_HFI_TRACE_H__
 
-#include <linux/atomic.h>
+#include <linux/spinlock.h>
+#include <linux/string.h>
 #include <linux/of.h>
 #include "iris_hfi_gen2_packet.h"
 
-/* Diagnostic only: bounded metadata, no payload dump or device access. */
-static atomic_t iris_psr_hfi_trace_budget = ATOMIC_INIT(256);
+/* Diagnostic only: finite per-translation-unit metadata; no device access. */
+#define IRIS_PSR_TRACE_SESSIONS 4
+#define IRIS_PSR_TRACE_EVENTS 256
+static DEFINE_SPINLOCK(iris_psr_hfi_trace_lock);
+static unsigned int iris_psr_hfi_trace_budget = IRIS_PSR_TRACE_EVENTS;
+static unsigned int iris_psr_hfi_trace_sessions;
+static struct {
+	struct iris_core *core;
+	u32 session;
+	unsigned int remaining;
+} iris_psr_hfi_trace_slots[IRIS_PSR_TRACE_SESSIONS];
 
-static inline bool iris_psr_hfi_trace_take(struct iris_core *core)
+/* Only successful enqueue/receive OPEN begins a new, finite session slot. */
+static inline void iris_psr_hfi_trace_open(struct iris_core *core,
+		const char *event, u32 session, const struct iris_hfi_packet *packet,
+		const struct iris_hfi_packet *raw, int ret)
 {
-	return of_device_is_compatible(core->dev->of_node, "qcom,kaanapali-iris") &&
-		atomic_dec_if_positive(&iris_psr_hfi_trace_budget) >= 0;
+	unsigned long flags;
+	unsigned int slot;
+
+	if (packet->type != HFI_CMD_OPEN || ret)
+		return;
+	if (!strcmp(event, "enqueue")) {
+		if (packet->payload_info != HFI_PAYLOAD_U32 ||
+		    packet->size - sizeof(*packet) < sizeof(session))
+			return;
+		memcpy(&session, (const u8 *)raw + sizeof(*packet), sizeof(session));
+	} else if (strcmp(event, "receive") ||
+		   packet->flags != HFI_FW_FLAGS_SUCCESS) {
+		return;
+	}
+	if (!session)
+		return;
+
+	spin_lock_irqsave(&iris_psr_hfi_trace_lock, flags);
+	if (iris_psr_hfi_trace_sessions < IRIS_PSR_TRACE_SESSIONS) {
+		slot = iris_psr_hfi_trace_sessions++;
+		iris_psr_hfi_trace_slots[slot].core = core;
+		iris_psr_hfi_trace_slots[slot].session = session;
+		iris_psr_hfi_trace_slots[slot].remaining = IRIS_PSR_TRACE_EVENTS;
+	}
+	spin_unlock_irqrestore(&iris_psr_hfi_trace_lock, flags);
+}
+
+static inline bool iris_psr_hfi_trace_take(struct iris_core *core, u32 session)
+{
+	unsigned int *budget = &iris_psr_hfi_trace_budget;
+	unsigned long flags;
+	bool taken = false;
+	int i;
+
+	if (!of_device_is_compatible(core->dev->of_node, "qcom,kaanapali-iris"))
+		return false;
+	spin_lock_irqsave(&iris_psr_hfi_trace_lock, flags);
+	/* Newest wins when a later OPEN reuses the driver's hashed session ID. */
+	for (i = (int)iris_psr_hfi_trace_sessions - 1; i >= 0; i--) {
+		if (iris_psr_hfi_trace_slots[i].core == core &&
+		    iris_psr_hfi_trace_slots[i].session == session) {
+			budget = &iris_psr_hfi_trace_slots[i].remaining;
+			break;
+		}
+	}
+	if (*budget) {
+		--*budget;
+		taken = true;
+	}
+	spin_unlock_irqrestore(&iris_psr_hfi_trace_lock, flags);
+	return taken;
 }
 
 static inline void iris_psr_hfi_trace_packet(struct iris_core *core,
@@ -26,8 +88,10 @@ static inline void iris_psr_hfi_trace_packet(struct iris_core *core,
 	    available < sizeof(packet))
 		return;
 	memcpy(&packet, pkt, sizeof(packet));
-	if (packet.size < sizeof(packet) || packet.size > available ||
-	    !iris_psr_hfi_trace_take(core))
+	if (packet.size < sizeof(packet) || packet.size > available)
+		return;
+	iris_psr_hfi_trace_open(core, event, session, &packet, pkt, ret);
+	if (!iris_psr_hfi_trace_take(core, session))
 		return;
 
 	dev_info(core->dev,
@@ -80,7 +144,7 @@ static inline void iris_psr_hfi_trace_header(struct iris_core *core,
 static inline void iris_psr_hfi_trace_done(struct iris_core *core, u32 session,
 		u32 type, u32 index, u32 attr, u32 data_size, int ret)
 {
-	if (iris_psr_hfi_trace_take(core))
+	if (iris_psr_hfi_trace_take(core, session))
 		dev_info(core->dev,
 			 "PSR HFI vb2-done session=%#x type=%u index=%u attr=%#x data_size=%u ret=%d\n",
 			 session, type, index, attr, data_size, ret);
