@@ -25,6 +25,7 @@
 #include <media/v4l2-fwnode.h>
 #include <media/v4l2-subdev.h>
 #include "psr-imx906-tables.h"
+#include "psr-dw9827c.h"
 
 static atomic_t psr_probe_gate = ATOMIC_INIT(0);
 
@@ -218,6 +219,7 @@ struct psr_imx906 {
 	struct v4l2_ctrl_handler ctrls;
 	struct mutex lock;
 	struct v4l2_ctrl *exposure_gain[2];
+	struct psr_focus focus;
 	bool configured, stream_fault;
 	struct regmap *map;
 	struct clk *clk;
@@ -328,6 +330,7 @@ static int psr_power_off(struct device *dev)
 {
 	struct psr_imx906 *s = to_psr(dev_get_drvdata(dev));
 	int ret = s->cleanup_error, err;
+	err = psr_focus_end(&s->focus); if (err && !ret) ret = err;
 	if (s->clock_enabled) {
 		clk_disable_unprepare(s->clk);
 		s->clock_enabled = false;
@@ -374,7 +377,8 @@ static int psr_set_ctrl(struct v4l2_ctrl *ctrl)
 	struct device *dev = s->sd.dev;
 	int ret;
 
-	if (ctrl->id != V4L2_CID_EXPOSURE)
+	if (ctrl->id != V4L2_CID_EXPOSURE &&
+	    ctrl->id != V4L2_CID_FOCUS_ABSOLUTE)
 		return -EINVAL;
 	if (s->stream_fault)
 		return -EIO;
@@ -383,8 +387,11 @@ static int psr_set_ctrl(struct v4l2_ctrl *ctrl)
 	ret = pm_runtime_get_if_in_use(dev);
 	if (ret <= 0)
 		return ret < 0 ? ret : 0;
-	ret = psr_apply_exposure(s, s->exposure_gain[0]->val,
-				 s->exposure_gain[1]->val);
+	if (ctrl->id == V4L2_CID_FOCUS_ABSOLUTE)
+		ret = psr_focus_set(&s->focus, ctrl->val);
+	else
+		ret = psr_apply_exposure(s, s->exposure_gain[0]->val,
+					 s->exposure_gain[1]->val);
 	if (ret) {
 		int off_ret;
 		/* Do not consume the stream PM reference: disable_streams owns it. */
@@ -415,6 +422,7 @@ static int psr_enable(struct v4l2_subdev *sd, struct v4l2_subdev_state *state,
 	s->stream_fault = false;
 	ret = psr_write(s, psr_init, ARRAY_SIZE(psr_init));
 	if (!ret) ret = psr_write(s, psr_mode0, ARRAY_SIZE(psr_mode0));
+	if (!ret) ret = psr_focus_begin(&s->focus);
 	if (!ret) {
 		s->configured = true;
 		ret = __v4l2_ctrl_handler_setup(&s->ctrls);
@@ -604,9 +612,11 @@ static int psr_probe_inner(struct i2c_client *client)
 		if (!ret) ret = off_ret;
 	}
 	if (ret) return dev_err_probe(dev, ret, "IMX906 identity check failed\n");
+	ret = psr_focus_init(&s->focus, client, &psr_focus_main);
+	if (ret) return dev_err_probe(dev, ret, "focus address reservation failed\n");
 	mutex_init(&s->lock);
     s->sd.state_lock = &s->lock;
-    v4l2_ctrl_handler_init(&s->ctrls, 4);
+    v4l2_ctrl_handler_init(&s->ctrls, 5);
     s->ctrls.lock = &s->lock;
 	link = v4l2_ctrl_new_int_menu(&s->ctrls, NULL, V4L2_CID_LINK_FREQ, 0, 0, psr_link_freq);
 	if (link) link->flags |= V4L2_CTRL_FLAG_READ_ONLY;
@@ -617,6 +627,9 @@ static int psr_probe_inner(struct i2c_client *client)
     link = v4l2_ctrl_new_std(&s->ctrls, NULL, V4L2_CID_DIGITAL_GAIN,
         256, 256, 1, 256);
     if (link) link->flags |= V4L2_CTRL_FLAG_READ_ONLY;
+	v4l2_ctrl_new_std(&s->ctrls, &psr_ctrl_ops, V4L2_CID_FOCUS_ABSOLUTE,
+		psr_focus_main.minimum, psr_focus_main.maximum, 1,
+		psr_focus_main.initial);
 	ret = s->ctrls.error;
 	if (ret) goto controls;
 	v4l2_ctrl_cluster(2, s->exposure_gain);
