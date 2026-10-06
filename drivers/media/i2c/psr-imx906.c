@@ -212,6 +212,15 @@ MODULE_PARM_DESC(activate_once, "One exact userspace device creation; 0 closed,1
  * do not infer an additional Bayer permutation from orientation registers. */
 #define PSR_CODE MEDIA_BUS_FMT_SRGGB10_1X10
 static const s64 psr_link_freq[] = { 3268800000LL };
+struct psr_mode {
+	u32 width, height, exposure_min, exposure_max, exposure_step, gain_max;
+	const struct psr_reg *registers;
+	unsigned int num_registers;
+};
+static const struct psr_mode psr_modes[] = {
+	{ 8192, 6144, 15, 6352, 1, 15360, psr_mode0, ARRAY_SIZE(psr_mode0) },
+	{ 4096, 3072, 8, 7480, 2, 16128, psr_mode1, ARRAY_SIZE(psr_mode1) },
+};
 enum psr_rail_state { PSR_OFF, PSR_ON, PSR_UNKNOWN };
 struct psr_imx906 {
 	struct v4l2_subdev sd;
@@ -220,6 +229,7 @@ struct psr_imx906 {
 	struct mutex lock;
 	struct v4l2_ctrl *exposure_gain[2];
 	struct psr_focus focus;
+	unsigned int mode;
 	bool configured, stream_fault;
 	struct regmap *map;
 	struct clk *clk;
@@ -362,7 +372,9 @@ static int psr_apply_exposure(struct psr_imx906 *s, u32 exposure, u32 gain)
         { 0x0204, gain >> 8, 0 }, { 0x0205, gain & 255, 0 },
         { 0x020e, 1, 0 }, { 0x020f, 0, 0 }, };
     int ret, release_ret;
-    if (exposure < 15 || exposure > 6352 || gain < 0 || gain > 15360)
+    const struct psr_mode *mode = &psr_modes[s->mode];
+    if (exposure < mode->exposure_min || exposure > mode->exposure_max ||
+        (exposure - mode->exposure_min) % mode->exposure_step || gain > mode->gain_max)
         return -ERANGE;
     ret = psr_write(s, &hold, 1);
     if (!ret) ret = psr_write(s, values, ARRAY_SIZE(values));
@@ -421,7 +433,8 @@ static int psr_enable(struct v4l2_subdev *sd, struct v4l2_subdev_state *state,
 		return ret;
 	s->stream_fault = false;
 	ret = psr_write(s, psr_init, ARRAY_SIZE(psr_init));
-	if (!ret) ret = psr_write(s, psr_mode0, ARRAY_SIZE(psr_mode0));
+	if (!ret) ret = psr_write(s, psr_modes[s->mode].registers,
+				psr_modes[s->mode].num_registers);
 	if (!ret) ret = psr_focus_begin(&s->focus);
 	if (!ret) {
 		s->configured = true;
@@ -463,10 +476,11 @@ static int psr_disable(struct v4l2_subdev *sd, struct v4l2_subdev_state *state,
 	return ret;
 }
 
-static void psr_format(struct v4l2_mbus_framefmt *f)
+static void psr_format(struct v4l2_mbus_framefmt *f, unsigned int index)
 {
 	*f = (struct v4l2_mbus_framefmt) {
-		.width = 8192, .height = 6144, .code = PSR_CODE,
+		.width = psr_modes[index].width, .height = psr_modes[index].height,
+		.code = PSR_CODE,
 		.field = V4L2_FIELD_NONE, .colorspace = V4L2_COLORSPACE_RAW,
 		.ycbcr_enc = V4L2_YCBCR_ENC_DEFAULT, .quantization = V4L2_QUANTIZATION_FULL_RANGE,
 		.xfer_func = V4L2_XFER_FUNC_NONE,
@@ -474,16 +488,35 @@ static void psr_format(struct v4l2_mbus_framefmt *f)
 }
 static int psr_init_state(struct v4l2_subdev *sd, struct v4l2_subdev_state *state)
 {
-	psr_format(v4l2_subdev_state_get_format(state, 0));
+	psr_format(v4l2_subdev_state_get_format(state, 0), 0);
 	return 0;
 }
 static int psr_set_fmt(struct v4l2_subdev *sd, struct v4l2_subdev_state *state,
 		       struct v4l2_subdev_format *f)
 {
+	struct psr_imx906 *s = to_psr(sd);
+	unsigned int index = f->format.width <= 4096 && f->format.height <= 3072;
+	const struct psr_mode *mode = &psr_modes[index];
+	int ret;
+
 	if (f->pad) return -EINVAL;
-	if (f->which == V4L2_SUBDEV_FORMAT_ACTIVE && v4l2_subdev_is_streaming(sd))
-		return -EBUSY;
-	psr_format(&f->format);
+	if (f->which == V4L2_SUBDEV_FORMAT_ACTIVE) {
+		if (v4l2_subdev_is_streaming(sd) || s->configured)
+			return -EBUSY;
+		/* State and controls share s->lock. Inactive controls only cache;
+		 * no sensor write or runtime-PM acquisition occurs in set_fmt. */
+		ret = __v4l2_ctrl_modify_range(s->exposure_gain[0],
+			mode->exposure_min, mode->exposure_max,
+			mode->exposure_step, mode->exposure_max);
+		if (ret)
+			return ret;
+		ret = __v4l2_ctrl_modify_range(s->exposure_gain[1],
+			0, mode->gain_max, 1, 0);
+		if (ret)
+			return ret;
+		s->mode = index;
+	}
+	psr_format(&f->format, index);
 	*v4l2_subdev_state_get_format(state, 0) = f->format;
 	return 0;
 }
@@ -497,9 +530,10 @@ static int psr_enum_code(struct v4l2_subdev *sd, struct v4l2_subdev_state *state
 static int psr_enum_size(struct v4l2_subdev *sd, struct v4l2_subdev_state *state,
 			struct v4l2_subdev_frame_size_enum *f)
 {
-	if (f->pad || f->index || f->code != PSR_CODE) return -EINVAL;
-	f->min_width = f->max_width = 8192;
-	f->min_height = f->max_height = 6144;
+	if (f->pad || f->index >= ARRAY_SIZE(psr_modes) || f->code != PSR_CODE)
+		return -EINVAL;
+	f->min_width = f->max_width = psr_modes[f->index].width;
+	f->min_height = f->max_height = psr_modes[f->index].height;
 	return 0;
 }
 static int psr_frame_desc(struct v4l2_subdev *sd, unsigned int pad,
@@ -513,9 +547,12 @@ static int psr_frame_desc(struct v4l2_subdev *sd, unsigned int pad,
 			.bus.csi2 = { .vc = 0, .dt = 0x2b },
 		},
 	};
-	/* VC0 is an unqualified first-frame hypothesis, supported by the matching
-	 * official IMX906 non-HDR full-mode descriptor. Captured metadata lists
-	 * [0,1]; verify complete8192x6144 frames/count before claiming operation. */
+	/* Only the RAW image stream is exposed. Captured mode1 also emits PDAF
+	 * datatype0x30 (4096x768); its stock writes are retained, but this driver
+	 * does not expose or decode that auxiliary stream. The matching official
+	 * preview descriptor identifies VC0 RAW0x2b and PDAF0x30. Native gen4 CSID
+	 * selects VC0 and the requested RAW datatype, filtering the auxiliary data.
+	 * Validate actual binned frames before claiming physical mode operation. */
 	return 0;
 }
 static const struct v4l2_subdev_pad_ops psr_pad_ops = {
