@@ -238,8 +238,12 @@ void iris_vpu_power_off(struct iris_core *core)
 	core->iris_platform_data->vpu_ops->power_off_controller(core);
 	iris_unset_icc_bw(core);
 
+	/* The threaded handler takes core->lock, held by power-off callers. */
 	if (!iris_vpu_watchdog(core, core->intr_status))
-		disable_irq(core->irq);
+		disable_irq_nosync(core->irq);
+	else
+		/* The existing watchdog mask becomes the power-off mask. */
+		core->irq_rearm_pending = false;
 }
 
 int iris_vpu_power_on_controller(struct iris_core *core)
@@ -490,6 +494,7 @@ int iris_vpu_power_on(struct iris_core *core)
 	iris_vpu_interrupt_init(core);
 	core->intr_status = 0;
 	enable_irq(core->irq);
+	iris_hfi_irq_rearm(core);
 
 	return 0;
 

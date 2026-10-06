@@ -101,20 +101,56 @@ irqreturn_t iris_hfi_isr(int irq, void *data)
 	return IRQ_WAKE_THREAD;
 }
 
+/* Caller holds core->lock and has independently established powered access. */
+void iris_hfi_irq_rearm(struct iris_core *core)
+{
+	lockdep_assert_held(&core->lock);
+	if (core->irq_rearm_pending) {
+		core->irq_rearm_pending = false;
+		enable_irq(core->irq);
+	}
+}
+
 irqreturn_t iris_hfi_isr_handler(int irq, void *data)
 {
 	struct iris_core *core = data;
+	int ret;
 
 	if (!core)
 		return IRQ_NONE;
 
+	/* Resume may take core->lock; acquire the PM reference before the lock. */
+	ret = pm_runtime_resume_and_get(core->dev);
+	if (ret < 0) {
+		/* Retain the top-half mask until a proven powered entry rearms it. */
+		mutex_lock(&core->lock);
+		core->irq_rearm_pending = true;
+		mutex_unlock(&core->lock);
+		dev_err_ratelimited(core->dev, "IRQ resume failed (%d); IRQ rearm deferred\n", ret);
+		return IRQ_HANDLED;
+	}
+
 	mutex_lock(&core->lock);
+	if (core->state == IRIS_CORE_ERROR) {
+		core->irq_rearm_pending = true;
+		mutex_unlock(&core->lock);
+		pm_runtime_put_autosuspend(core->dev);
+		return IRQ_HANDLED;
+	}
+	if (core->state != IRIS_CORE_INIT) {
+		mutex_unlock(&core->lock);
+		goto put_pm;
+	}
 	pm_runtime_mark_last_busy(core->dev);
 	iris_vpu_clear_interrupt(core);
 	mutex_unlock(&core->lock);
 
+	/* Queue reads also take core->lock; keep hardware powered throughout. */
 	core->hfi_sys_ops->sys_hfi_response_handler(core);
 
+put_pm:
+	pm_runtime_mark_last_busy(core->dev);
+	pm_runtime_put_autosuspend(core->dev);
 	if (!iris_vpu_watchdog(core, core->intr_status))
 		enable_irq(irq);
 

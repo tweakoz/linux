@@ -74,6 +74,7 @@ struct qcom_ubwc_cfg_data;
  * @power: a structure for clock and bw information
  * @hfi_sys_ops: iris HFI system ops
  * @core_init_done: structure of signal completion for system response
+ * @irq_rearm_pending: retained top-half IRQ mask, protected by core lock
  * @intr_status: interrupt status
  * @sys_error_handler: a delayed work for handling system fatal error
  * @instances: a list_head of all instances
@@ -121,6 +122,7 @@ struct iris_core {
 	struct iris_psr_llcc psr_llcc;
 	const struct iris_hfi_sys_ops		*hfi_sys_ops;
 	struct completion			core_init_done;
+	bool					irq_rearm_pending;
 	u32					intr_status;
 	struct delayed_work			sys_error_handler;
 	struct list_head			instances;
