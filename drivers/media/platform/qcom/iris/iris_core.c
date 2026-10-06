@@ -69,6 +69,8 @@ int iris_core_init(struct iris_core *core)
 		goto exit;
 	}
 	if (core->state == IRIS_CORE_INIT) {
+		/* iris_open holds a successful runtime PM reference. */
+		iris_hfi_irq_rearm(core);
 		ret = 0;
 		goto exit;
 	} else if (core->state == IRIS_CORE_ERROR) {

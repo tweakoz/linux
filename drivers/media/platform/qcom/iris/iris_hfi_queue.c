@@ -119,6 +119,9 @@ int iris_hfi_queue_cmd_write_locked(struct iris_core *core, void *pkt, u32 pkt_s
 		return -EINVAL;
 	}
 
+	/* The locked command path runs only after power-on or a PM get. */
+	iris_hfi_irq_rearm(core);
+
 	if (!iris_hfi_queue_write(q_info, pkt, pkt_size)) {
 		iris_vpu_raise_interrupt(core);
 		iris_psr_hfi_trace_header(core, "enqueue", pkt, pkt_size, 0);

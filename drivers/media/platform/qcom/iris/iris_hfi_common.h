@@ -158,5 +158,6 @@ int iris_hfi_pm_resume(struct iris_core *core);
 
 irqreturn_t iris_hfi_isr(int irq, void *data);
 irqreturn_t iris_hfi_isr_handler(int irq, void *data);
+void iris_hfi_irq_rearm(struct iris_core *core);
 
 #endif
