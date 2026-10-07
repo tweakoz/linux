@@ -58,55 +58,59 @@ static int iris_hfi_queue_write(struct iris_iface_q_info *qinfo, void *packet, u
 static int iris_hfi_queue_read(struct iris_iface_q_info *qinfo, void *packet)
 {
 	struct iris_hfi_queue_header *queue = qinfo->qhdr;
-	u32 write_idx = queue->write_idx * sizeof(u32);
-	u32 read_idx = queue->read_idx * sizeof(u32);
-	u32 packet_size, receive_request = 0;
+	u32 write_idx = READ_ONCE(queue->write_idx);
+	u32 read_idx = READ_ONCE(queue->read_idx);
+	u32 packet_size, receive_request = 0, available;
 	u32 new_read_idx, residue;
 	u32 *read_ptr;
 	int ret = 0;
+
+	/* Validate word indices before multiplication or forming a pointer. */
+	if (read_idx >= IFACEQ_QUEUE_SIZE / sizeof(u32) ||
+	    write_idx >= IFACEQ_QUEUE_SIZE / sizeof(u32))
+		return -EBADMSG;
+	read_idx *= sizeof(u32);
+	write_idx *= sizeof(u32);
 
 	if (queue->queue_type == IFACEQ_MSGQ_ID)
 		receive_request = 1;
 
 	if (read_idx == write_idx) {
-		queue->rx_req = receive_request;
-		/* Ensure qhdr is updated in main memory */
+		WRITE_ONCE(queue->rx_req, receive_request);
 		mb();
 		return -ENODATA;
 	}
 
+	/* Firmware publishes the payload before its write index. */
+	dma_rmb();
+	available = write_idx > read_idx ? write_idx - read_idx :
+		IFACEQ_QUEUE_SIZE - read_idx + write_idx;
 	read_ptr = qinfo->kernel_vaddr + read_idx;
-	if (read_ptr < (u32 *)qinfo->kernel_vaddr ||
-	    read_ptr > (u32 *)(qinfo->kernel_vaddr +
-	    IFACEQ_QUEUE_SIZE - sizeof(*read_ptr)))
-		return -ENODATA;
-
-	packet_size = *read_ptr;
-	if (!packet_size)
-		return -EINVAL;
-
-	new_read_idx = read_idx + packet_size;
-	if (packet_size <= IFACEQ_CORE_PKT_SIZE) {
-		if (new_read_idx < IFACEQ_QUEUE_SIZE) {
-			memcpy(packet, read_ptr, packet_size);
-		} else {
-			residue = new_read_idx - IFACEQ_QUEUE_SIZE;
-			memcpy(packet, read_ptr, (packet_size - residue));
-			memcpy((packet + (packet_size - residue)),
-			       qinfo->kernel_vaddr, residue);
-			new_read_idx = residue;
-		}
-	} else {
+	packet_size = READ_ONCE(*read_ptr);
+	if (packet_size < sizeof(u32) || packet_size % sizeof(u32) ||
+	    packet_size > IFACEQ_CORE_PKT_SIZE || packet_size > available) {
+		/* Discard only the malformed snapshot, as for an oversized packet. */
 		new_read_idx = write_idx;
 		ret = -EBADMSG;
+		goto update;
 	}
 
-	queue->rx_req = receive_request;
+	new_read_idx = read_idx + packet_size;
+	if (new_read_idx < IFACEQ_QUEUE_SIZE) {
+		memcpy(packet, read_ptr, packet_size);
+	} else {
+		residue = new_read_idx - IFACEQ_QUEUE_SIZE;
+		memcpy(packet, read_ptr, packet_size - residue);
+		memcpy(packet + packet_size - residue, qinfo->kernel_vaddr, residue);
+		new_read_idx = residue;
+	}
 
-	queue->read_idx = new_read_idx / sizeof(u32);
-	/* Ensure qhdr is updated in main memory */
+update:
+	/* Finish consuming payload before firmware may reuse the ring slots. */
+	dma_mb();
+	WRITE_ONCE(queue->rx_req, receive_request);
+	WRITE_ONCE(queue->read_idx, new_read_idx / sizeof(u32));
 	mb();
-
 	return ret;
 }
 
@@ -140,7 +144,7 @@ int iris_hfi_queue_cmd_write(struct iris_core *core, void *pkt, u32 pkt_size)
 
 	ret = pm_runtime_resume_and_get(core->dev);
 	if (ret < 0)
-		goto exit;
+		return ret;
 
 	mutex_lock(&core->lock);
 	ret = iris_hfi_queue_cmd_write_locked(core, pkt, pkt_size);
@@ -171,10 +175,9 @@ int iris_hfi_queue_msg_read(struct iris_core *core, void *pkt)
 		goto unlock;
 	}
 
-	if (iris_hfi_queue_read(q_info, pkt)) {
-		ret = -ENODATA;
-		goto unlock;
-	}
+	ret = iris_hfi_queue_read(q_info, pkt);
+	if (ret && ret != -ENODATA)
+		dev_err_ratelimited(core->dev, "invalid HFI msg queue packet (%d)\n", ret);
 
 unlock:
 	mutex_unlock(&core->lock);
@@ -193,10 +196,9 @@ int iris_hfi_queue_dbg_read(struct iris_core *core, void *pkt)
 		goto unlock;
 	}
 
-	if (iris_hfi_queue_read(q_info, pkt)) {
-		ret = -ENODATA;
-		goto unlock;
-	}
+	ret = iris_hfi_queue_read(q_info, pkt);
+	if (ret && ret != -ENODATA)
+		dev_err_ratelimited(core->dev, "invalid HFI dbg queue packet (%d)\n", ret);
 
 unlock:
 	mutex_unlock(&core->lock);

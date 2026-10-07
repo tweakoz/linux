@@ -162,41 +162,45 @@ static bool iris_hfi_gen2_validate_packet_payload(struct iris_hfi_packet *pkt)
 	return true;
 }
 
-static int iris_hfi_gen2_validate_packet(u8 *response_pkt, u8 *core_resp_pkt)
+static int iris_hfi_gen2_validate_packet(u8 *response_pkt, u8 *response_limit)
 {
-	u8 *response_limit = core_resp_pkt + IFACEQ_CORE_PKT_SIZE;
-	u32 response_pkt_size = *(u32 *)response_pkt;
+	u32 response_pkt_size, remaining;
 
-	if (!response_pkt_size)
+	/* Check the complete fixed header before reading any packet fields. */
+	if (response_pkt > response_limit)
 		return -EINVAL;
-
-	if (response_pkt_size < sizeof(struct iris_hfi_packet))
+	remaining = response_limit - response_pkt;
+	if (remaining < sizeof(struct iris_hfi_packet))
 		return -EINVAL;
-
-	if (response_pkt + response_pkt_size > response_limit)
+	response_pkt_size = *(u32 *)response_pkt;
+	if (response_pkt_size < sizeof(struct iris_hfi_packet) ||
+	    response_pkt_size % sizeof(u32) ||
+	    response_pkt_size > remaining)
 		return -EINVAL;
-
 	return 0;
 }
 
 static int iris_hfi_gen2_validate_hdr_packet(struct iris_core *core, struct iris_hfi_header *hdr)
 {
 	struct iris_hfi_packet *packet;
-	int ret;
-	u8 *pkt;
+	u8 *pkt, *limit;
 	u32 i;
+	int ret;
 
-	if (hdr->size < sizeof(*hdr) + sizeof(*packet))
+	if (hdr->size < sizeof(*hdr) + sizeof(*packet) ||
+	    hdr->size > IFACEQ_CORE_PKT_SIZE || hdr->size % sizeof(u32))
+		return -EINVAL;
+	if (!hdr->num_packets ||
+	    hdr->num_packets > (hdr->size - sizeof(*hdr)) / sizeof(*packet))
 		return -EINVAL;
 
-	pkt = (u8 *)((u8 *)hdr + sizeof(*hdr));
-
+	pkt = (u8 *)hdr + sizeof(*hdr);
+	limit = (u8 *)hdr + hdr->size;
 	for (i = 0; i < hdr->num_packets; i++) {
-		packet = (struct iris_hfi_packet *)pkt;
-		ret = iris_hfi_gen2_validate_packet(pkt, core->response_packet);
+		ret = iris_hfi_gen2_validate_packet(pkt, limit);
 		if (ret)
 			return ret;
-
+		packet = (struct iris_hfi_packet *)pkt;
 		pkt += packet->size;
 	}
 
@@ -1220,7 +1224,7 @@ static void iris_hfi_gen2_flush_debug_queue(struct iris_core *core, u8 *packet)
 	while (!iris_hfi_queue_dbg_read(core, packet)) {
 		pkt = (struct hfi_debug_header *)packet;
 
-		if (pkt->size < sizeof(*pkt))
+		if (pkt->size <= sizeof(*pkt))
 			continue;
 
 		if (pkt->size >= IFACEQ_CORE_PKT_SIZE)
