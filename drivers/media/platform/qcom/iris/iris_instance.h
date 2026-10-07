@@ -6,6 +6,7 @@
 #ifndef __IRIS_INSTANCE_H__
 #define __IRIS_INSTANCE_H__
 
+#include <linux/refcount.h>
 #include <media/v4l2-ctrls.h>
 
 #include "iris_buffer.h"
@@ -87,6 +88,10 @@ struct iris_inst {
 	const struct iris_hfi_session_ops	*hfi_session_ops;
 	struct mutex			ctx_q_lock;/* lock to serialize queues related ioctls */
 	struct mutex			lock; /* lock to serialize forward and reverse threads */
+	/* One owner reference plus response lookups; drained before any teardown. */
+	refcount_t			response_refs;
+	struct completion		response_idle;
+	bool				responses_stopped; /* protected by lock */
 	struct v4l2_fh			fh;
 	struct v4l2_format		*fmt_src;
 	struct v4l2_format		*fmt_dst;

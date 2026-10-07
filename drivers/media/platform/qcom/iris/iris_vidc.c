@@ -92,7 +92,7 @@ static void iris_remove_session(struct iris_inst *inst)
 
 	mutex_lock(&core->lock);
 	list_for_each_entry_safe(iter, temp, &core->instances, list) {
-		if (iter->session_id == inst->session_id) {
+		if (iter == inst) {
 			list_del_init(&iter->list);
 			break;
 		}
@@ -223,6 +223,9 @@ int iris_open(struct file *filp)
 	INIT_LIST_HEAD(&inst->buffers[BUF_SCRATCH_2].list);
 	INIT_LIST_HEAD(&inst->buffers[BUF_VPSS].list);
 	INIT_LIST_HEAD(&inst->buffers[BUF_PARTIAL].list);
+	refcount_set(&inst->response_refs, 1);
+	init_completion(&inst->response_idle);
+	inst->responses_stopped = false;
 	init_completion(&inst->completion);
 	init_completion(&inst->flush_completion);
 
@@ -331,18 +334,37 @@ int iris_close(struct file *filp)
 {
 	struct iris_inst *inst = iris_get_inst(filp);
 
-	v4l2_ctrl_handler_free(&inst->ctrl_handler);
-	v4l2_m2m_ctx_release(inst->m2m_ctx);
-	v4l2_m2m_release(inst->m2m_dev);
+	/* Stop both queues without freeing them: STOP/CLOSE replies still need
+	 * the context, controls and instance. These queues have no file-I/O mode.
+	 * Match v4l2_m2m_ctx_release()'s capture/output cancellation order.
+	 */
+	mutex_lock(&inst->ctx_q_lock);
+	v4l2_m2m_streamoff(filp, inst->m2m_ctx, V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE);
+	v4l2_m2m_streamoff(filp, inst->m2m_ctx, V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE);
+	mutex_unlock(&inst->ctx_q_lock);
+
 	mutex_lock(&inst->lock);
 	iris_session_close(inst);
+	inst->responses_stopped = true;
+	iris_remove_session(inst);
+	mutex_unlock(&inst->lock);
+
+	/* No new lookup can succeed. Do not hold either mutex while a prior
+	 * lookup reaches its response guard and releases its reference.
+	 */
+	iris_put_instance(inst);
+	wait_for_completion(&inst->response_idle);
+
+	v4l2_m2m_ctx_release(inst->m2m_ctx);
+	v4l2_m2m_release(inst->m2m_dev);
+	v4l2_ctrl_handler_free(&inst->ctrl_handler);
+	mutex_lock(&inst->lock);
 	iris_inst_change_state(inst, IRIS_INST_DEINIT);
 	iris_v4l2_fh_deinit(inst, filp);
 	iris_destroy_all_internal_buffers(inst, V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE);
 	iris_destroy_all_internal_buffers(inst, V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE);
 	iris_check_num_queued_internal_buffers(inst, V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE);
 	iris_check_num_queued_internal_buffers(inst, V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE);
-	iris_remove_session(inst);
 	mutex_unlock(&inst->lock);
 	mutex_destroy(&inst->ctx_q_lock);
 	mutex_destroy(&inst->lock);

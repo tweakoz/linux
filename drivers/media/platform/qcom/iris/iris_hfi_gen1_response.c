@@ -630,9 +630,12 @@ static void iris_hfi_gen1_handle_response(struct iris_core *core, void *response
 		inst = iris_get_instance(core, pkt->shdr.session_id);
 		if (inst) {
 			mutex_lock(&inst->lock);
-			iris_hfi_gen1_session_event_notify(inst, hdr);
+			if (!inst->responses_stopped)
+				iris_hfi_gen1_session_event_notify(inst, hdr);
 			mutex_unlock(&inst->lock);
-		} else {
+			iris_put_instance(inst);
+		} else if (((struct hfi_msg_event_notify_pkt *)hdr)->event_id ==
+			   HFI_EVENT_SYS_ERROR) {
 			iris_hfi_gen1_sys_event_notify(core, hdr);
 		}
 
@@ -648,6 +651,8 @@ static void iris_hfi_gen1_handle_response(struct iris_core *core, void *response
 		}
 
 		mutex_lock(&inst->lock);
+		if (inst->responses_stopped)
+			goto unlock;
 		if (hdr->pkt_type == HFI_MSG_SESSION_EMPTY_BUFFER) {
 			iris_hfi_gen1_session_etb_done(inst, hdr);
 		} else if (hdr->pkt_type == HFI_MSG_SESSION_FILL_BUFFER) {
@@ -666,7 +671,9 @@ static void iris_hfi_gen1_handle_response(struct iris_core *core, void *response
 				complete(&inst->completion);
 			}
 		}
+unlock:
 		mutex_unlock(&inst->lock);
+		iris_put_instance(inst);
 
 		break;
 	}

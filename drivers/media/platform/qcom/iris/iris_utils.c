@@ -85,6 +85,7 @@ int iris_wait_for_session_response(struct iris_inst *inst, bool is_flush)
 	return 0;
 }
 
+/* Caller must iris_put_instance() after its last access, including error paths. */
 struct iris_inst *iris_get_instance(struct iris_core *core, u32 session_id)
 {
 	struct iris_inst *inst;
@@ -92,6 +93,7 @@ struct iris_inst *iris_get_instance(struct iris_core *core, u32 session_id)
 	mutex_lock(&core->lock);
 	list_for_each_entry(inst, &core->instances, list) {
 		if (inst->session_id == session_id) {
+			refcount_inc(&inst->response_refs);
 			mutex_unlock(&core->lock);
 			return inst;
 		}
@@ -99,6 +101,12 @@ struct iris_inst *iris_get_instance(struct iris_core *core, u32 session_id)
 
 	mutex_unlock(&core->lock);
 	return NULL;
+}
+
+void iris_put_instance(struct iris_inst *inst)
+{
+	if (refcount_dec_and_test(&inst->response_refs))
+		complete(&inst->response_idle);
 }
 
 int iris_check_core_mbpf(struct iris_inst *inst)

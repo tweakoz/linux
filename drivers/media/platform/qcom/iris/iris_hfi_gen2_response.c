@@ -1156,6 +1156,8 @@ static int iris_hfi_gen2_handle_session_response(struct iris_core *core,
 		return -EINVAL;
 
 	mutex_lock(&inst->lock);
+	if (inst->responses_stopped)
+		goto unlock;
 	inst_hfi_gen2 = to_iris_inst_hfi_gen2(inst);
 	memset(&inst_hfi_gen2->hfi_frame_info, 0, sizeof(struct iris_hfi_frame_info));
 
@@ -1194,7 +1196,9 @@ static int iris_hfi_gen2_handle_session_response(struct iris_core *core,
 	if (dequeue)
 		iris_hfi_gen2_handle_dequeue_buffers(inst);
 
+unlock:
 	mutex_unlock(&inst->lock);
+	iris_put_instance(inst);
 
 	return ret;
 }
